@@ -57,12 +57,12 @@ edition is not verified.
 | Level | Standard name | Status | Rhizomorph use |
 | :--- | :--- | :--- | :--- |
 | 1 | Manual-Life Safety | assigned by the standard | Never taken by a guest ([ADR-0003](0003-wit-contract-push-model.md)) |
-| 2 | Automatic-Life Safety | assigned by the standard | Writers beyond guests not yet decided; whether a plugin may take it is open in ADR-0003 |
-| 3, 4 | Available | free | Unassigned |
-| 5 | Critical Equipment Control | assigned by the standard | Not yet decided; whether a plugin may take it is open in ADR-0003 |
+| 2 | Automatic-Life Safety | assigned by the standard | A guest only with an explicit manifest grant ([ADR-0003](0003-wit-contract-push-model.md#priority-cap)); writers beyond guests not yet decided |
+| 3, 4 | Available | free | Unassigned; refused for every guest ([ADR-0003](0003-wit-contract-push-model.md#priority-cap)) |
+| 5 | Critical Equipment Control | assigned by the standard | A guest only with an explicit manifest grant ([ADR-0003](0003-wit-contract-push-model.md#priority-cap)); writers beyond guests not yet decided |
 | 6 | Minimum On/Off | assigned by the standard | Reserved for the minimum on and off time algorithm of an object; refused for every external writer |
-| 7 | Available | free | Unassigned |
-| 8 | Manual Operator | assigned by the standard | Proposed for user commands |
+| 7 | Available | free | Unassigned; refused for every guest ([ADR-0003](0003-wit-contract-push-model.md#priority-cap)) |
+| 8 | Manual Operator | assigned by the standard | Proposed for user commands; refused for every guest ([ADR-0003](0003-wit-contract-push-model.md#priority-cap)) |
 | 9 | Available | free | Unassigned |
 | 10 | Available | free | Control loops; a project convention, not a standard name |
 | 11 | Available | free | Unassigned |

@@ -133,17 +133,24 @@ Decisions: [ADR-0003](../adr/0003-wit-contract-push-model.md). Defect fixed: 8
 (kept on purpose).
 
 - **Positive**: `init` returns point ids and `on-cov` receives pushed events
-  for them only; `command-point` sets a slot under the host-held lease.
+  for them only; `command-point` sets a slot under the host-held lease; a
+  guest without a declared cap commands levels 9 and 16; a guest granted
+  level 2 commands at 2, and a guest granted level 5 commands at 5.
 - **Negative**: a trap, a memory overrun and a missed epoch deadline each
   revoke the lease and fire COV; a guest blocked in a host call is ended by
   the host timeout; a guest cannot express level 1 or 6; a subscription,
   report or command for a point the manifest does not list is refused; a
   module with more memories or instances than the store caps fails to
-  instantiate.
+  instantiate; without a grant, a command at level 2 or 5 is refused; a
+  grant for 2 does not open 5; a command at 3, 4, 7 or 8 is refused for
+  every guest; a manifest with a cap of 8 or a grant for level 1, 3 or 6
+  fails to load.
 - **Boundary**: memory grown to exactly the `StoreLimits` cap, and one step
   past it traps and revokes the lease; the deadline at the tick before and
   after expiry, including a guest that returns from a slow host call; a
-  replay test using fuel for a deterministic trap; queue at its bound.
+  replay test using fuel for a deterministic trap; queue at its bound; a cap
+  of 9 accepts level 9 and refuses 8; a cap of 16 accepts 16 and refuses 15;
+  caps of 0 and 17 fail to load.
 
 ## P4: Daemon
 

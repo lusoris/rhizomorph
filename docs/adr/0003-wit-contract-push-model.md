@@ -58,9 +58,8 @@ Rules of the contract:
   also leaves out level 6, which no external writer takes
   ([ADR-0002](0002-priority-array-and-leases.md)). A request for a level the
   type cannot express is impossible to write, so no runtime check can be
-  skipped. The host still validates every level against `Priority`. Whether
-  it also checks a level cap from the manifest is the
-  [open question](#open-question) below.
+  skipped. The host still validates every level against `Priority`, and
+  against the manifest's level cap ([Priority cap](#priority-cap)).
 - **Bounded guests.** The number of guest stores that run at once has a
   fixed upper bound, set in P3 (HISS-06).
 
@@ -112,14 +111,29 @@ not verified: no source was found showing a `progenitor` client (which
 depends on `progenitor-client` 0.16.1, MPL-2.0) built for `wasm32-wasip2`
 and reaching the network through `wasmtime-wasi-http` 50.0.2.
 
-### Open question
+### Priority cap
 
-Must a plugin manifest also cap the highest level a guest may take? The
-guest type allows levels 2 and 5, which the standard assigns to life safety
-and critical equipment. With a cap, a plugin takes those levels only with an
-explicit grant, at the cost of one more manifest field and host check.
-Without one, the guest type alone bounds the levels. Not decided; it blocks
-the final WIT file in P3.
+The guest type allows levels 2 and 5, which the standard assigns to
+Automatic-Life Safety and Critical Equipment Control. A manifest therefore
+caps the levels its guest may take:
+
+- **Declared cap.** Every plugin manifest declares the strongest level its
+  guest may command, a number from 9 to 16. Without a declaration the cap is
+  9, so the guest takes levels 9 to 16.
+- **Grants for 2 and 5.** A guest takes level 2 or level 5 only with an
+  explicit grant for that level in its manifest. A grant names one level; a
+  grant for 2 does not open 5, and the reverse.
+- **Two host checks.** The host checks the manifest when it loads the plugin
+  and refuses to load a cap outside 9 to 16 or a grant for any level other
+  than 2 or 5. It checks again on every `command-point` and
+  `relinquish-point` call: the level must be at or weaker than the cap, or
+  be a granted level.
+- **Levels 3, 4, 7 and 8.** The guest type can express them, but no cap and
+  no grant opens them, so the host refuses them for every guest.
+- **Level 1** stays outside the guest type, so no manifest can grant it.
+
+The manifest syntax for the cap and the grants is written in P3, with the
+final WIT file.
 
 ## Consequences
 
@@ -129,11 +143,15 @@ the final WIT file in P3.
 - **Negative**: The deadline protects against code running, not against a
   guest blocked in a host call; every host function needs its own timeout.
   Epoch interruption excludes the Winch compiler. A guest without level 1 can
-  never perform a manual life-safety override.
+  never perform a manual life-safety override. The priority cap adds one
+  manifest field, grants and two host checks, and a plugin that needs level
+  2 or 5 must say so in its manifest.
 
 ## References
 
 - Design input by the operator, restated; no document is quoted.
+- Priority cap: owner decision (paraphrased; decision, 2026-11-18, guest
+  priority cap), restated in [Priority cap](#priority-cap).
 - Wasmtime tag v50.0.2, `crates/wasmtime/src/config.rs` (sha256
   fa5c06563662) and `crates/wasmtime/src/runtime/limits.rs` (sha256
   07d25368279a), checked 2026-11-18.
