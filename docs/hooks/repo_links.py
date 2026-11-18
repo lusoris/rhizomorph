@@ -8,7 +8,8 @@ parsing at priority 20, before MkDocs' relative-path validator at priority 0).
 In on_page_markdown, the hook records the active page URI on the extension. The
 treeprocessor handles relative anchor hrefs that leave docs/ (including ``..``):
 links that step back into docs/ are rewritten to page-relative paths so MkDocs
-validates the target and any heading anchor; links to the repository root
+validates the target and any heading anchor; directory targets resolve to
+index.md, else README.md; links to the repository root
 (``repo_path == "."``) rewrite to the forge tree base URL; links to tracked
 files or directories outside docs/ rewrite to forge blob or tree URLs; and links
 that escape above the repository root or target an untracked repository path log
@@ -110,6 +111,16 @@ class RepoLinksExtension(Extension):
         """Record the docs-relative URI of the page about to be rendered."""
         self.src_uri = src_uri.replace("\\", "/")
 
+    def _docs_target(self, repo_path: str) -> str:
+        """Resolve tracked directories to their preferred Markdown page."""
+        if repo_path in self._tracked_files:
+            return repo_path
+        for name in ("index.md", "README.md"):
+            candidate = posixpath.join(repo_path, name)
+            if candidate in self._tracked_files:
+                return candidate
+        return repo_path
+
     def _docs_relative_href(
         self,
         repo_path: str,
@@ -118,10 +129,11 @@ class RepoLinksExtension(Extension):
         suffix: str,
     ) -> str:
         """Return a page-relative href for a link that re-enters docs/."""
-        in_docs = posixpath.relpath(repo_path, self.docs_rel)
+        target = self._docs_target(repo_path)
+        in_docs = posixpath.relpath(target, self.docs_rel)
         rel_page = posixpath.relpath(in_docs, page_dir or ".")
         quoted = urllib.parse.quote(rel_page)
-        if parts.path.endswith("/") and not quoted.endswith("/"):
+        if target == repo_path and parts.path.endswith("/") and not quoted.endswith("/"):
             quoted = f"{quoted}/"
         return f"{quoted}{suffix}"
 

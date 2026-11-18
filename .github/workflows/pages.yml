@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 #
-# Build the MkDocs site under --strict on pull requests and pushes that touch
-# the documentation, and deploy it to GitHub Pages from main.
+# Build the MkDocs site under --strict on pull requests and pushes to main,
+# and deploy it to GitHub Pages from main.
 name: Docs
 
 'on':
@@ -11,10 +11,6 @@ name: Docs
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: ['main']
-    paths:
-      - 'docs/**'
-      - 'mkdocs.yml'
-      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
@@ -95,6 +91,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
@@ -104,7 +101,25 @@ jobs:
       group: pages
       cancel-in-progress: false
     steps:
+      # Prevent a late older build or a rerun of an old run from deploying.
+      - name: Check that this run is the main head
+        id: head
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          head_sha=$(timeout 60 gh api "repos/$REPO/commits/main" --jq .sha)
+          if [ "$head_sha" = "$RUN_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=Deploy skipped::$RUN_SHA is not the main head" \
+              "$head_sha; the run for the newer commit deploys it."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Deploy to GitHub Pages
+        if: steps.head.outputs.current == 'true'
         id: deployment
         # yamllint disable-line rule:line-length
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1
