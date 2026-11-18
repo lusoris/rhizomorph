@@ -316,12 +316,15 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
      [ADR-0002](../adr/0002-priority-array-and-leases.md)). Any interlock that
      commands a separate commandable output point at `Automatic-Life Safety`
      priority level 2 is a separate design decision, as priority arrays belong
-     only to commandable outputs and writers for level 2 remain open in
-     [ADR-0002](../adr/0002-priority-array-and-leases.md).
+     only to commandable outputs and
+     [ADR-0002](../adr/0002-priority-array-and-leases.md) opens level 2 to a
+     guest only on a manifest request plus a host record
+     ([ADR-0003](../adr/0003-wit-contract-push-model.md#priority-cap)) and
+     leaves writers beyond guests open.
    - **Affected cells:** Class 13 (Life safety) across all building types except
      `outdoor and garden`.
    - **Source:** [`docs/adr/0002-priority-array-and-leases.md`](../adr/0002-priority-array-and-leases.md)
-     lines 26–35 and 47–68, and EU Construction Products Regulation `Regulation
+     lines 26–28, 44–45 and 51–84, and EU Construction Products Regulation `Regulation
      (EU) No 305/2011` / `EN 14604` / `EN 54` (verified via web search
      2026-11-18).
 

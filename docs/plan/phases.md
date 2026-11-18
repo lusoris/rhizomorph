@@ -96,8 +96,8 @@ Tests:
   in by the adapter.
 - **Negative**: NaN and infinities refused at ingress; `Priority` 0 and 17
   refused; level 6 refused for every external writer; a lease cannot clear
-  another lease's slot; a write under a revoked lease refused; revoking a
-  lease twice, or an id never issued, changes nothing; negative or
+  another lease's slot; a write or relinquish under a revoked lease refused;
+  revoking a lease twice, or an id never issued, changes nothing; negative or
   non-finite deadband refused at registration; an `i64` and an `f64` of
   equal magnitude are not equal; a registration or lease request past its
   capacity refused; a command to an input, telemetry for an output, a value
@@ -110,7 +110,9 @@ Tests:
   the size assertion `PriorityArray` = 384 bytes on x86_64 (not promised on
   32-bit targets); revoke of a lease that holds one point among many visits
   only that point; a command to a new point when the lease's index is at
-  capacity is refused and leaves every slot unchanged.
+  capacity is refused and leaves every slot unchanged; a lease id is not
+  reused while the kernel runs, and a lease request after the last id is
+  refused instead of wrapping.
 - A write to a slot that another lease holds, and a writer that hangs
   without failing: P1 decides both
   ([ADR-0002](../adr/0002-priority-array-and-leases.md#leases)) and tests

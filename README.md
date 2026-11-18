@@ -3,9 +3,10 @@
 Local-first smart-home and building-automation engine: a Rust core with a
 SvelteKit interface.
 
-> **Status: design.** The concept, the decision records (all Proposed) and
-> the phase plan are under [`docs/`](#documentation). There is no engine code
-> and no release yet; code follows the phase plan, starting with P1.
+> **Status: design.** The concept, the decision records (each with its status
+> in [`docs/adr/README.md`](docs/adr/README.md)) and the phase plan are under
+> [`docs/`](#documentation). There is no engine code and no release yet; code
+> follows the phase plan, starting with P1.
 
 ## Start here
 
@@ -68,9 +69,14 @@ written from it.
 - [`docs/concept.md`](docs/concept.md): what rhizomorph is, the research behind
   it, prior art and what is still unverified.
 - [`docs/adr/`](docs/adr/README.md): decision records, from the tier model to
-  the UI stack.
+  the hardware repository.
 - [`docs/plan/phases.md`](docs/plan/phases.md): the phase plan, with exit
   checks.
+- [`docs/plan/hardware.md`](docs/plan/hardware.md): the hardware plan, stages
+  H0 to H3 with entry conditions and exit checks.
+- [`docs/plan/coverage-matrix.md`](docs/plan/coverage-matrix.md): device
+  classes across building types, the protocol each needs, and every gap with
+  its source.
 - [`docs/plan/design-defects.md`](docs/plan/design-defects.md): known defects
   of the design reference code and their fixes.
 - [`docs/fungal-mapping.md`](docs/fungal-mapping.md): how the name maps to
