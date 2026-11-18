@@ -15,3 +15,6 @@ bin/
 .github/instructions/codacy.instructions.md
 .cursor/rules/codacy.mdc
 # END praetor private artifacts
+
+/site/
+__pycache__/
