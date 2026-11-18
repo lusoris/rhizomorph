@@ -136,27 +136,30 @@ Decisions: [ADR-0003](../adr/0003-wit-contract-push-model.md). Defect fixed: 8
 
 - **Positive**: `init` returns point ids and `on-cov` receives pushed events
   for them only; `command-point` sets a slot under the host-held lease; a
-  guest without a declared cap commands levels 9 and 16; a guest granted
-  level 2 commands at 2, and a guest granted level 5 commands at 5.
+  guest without a declared cap commands levels 9 and 16; a guest whose
+  manifest requests level 2 and whose digest has a host record for level 2
+  loads and commands at 2; the same for level 5.
 - **Negative**: a trap, a memory overrun and a missed epoch deadline each
   revoke the lease and fire COV; a guest blocked in a host call is ended by
   the host timeout; a guest cannot express level 1 or 6; a subscription,
   report or command for a point the manifest does not list is refused; a
   module with more memories or instances than the store caps fails to
-  instantiate; without a grant, a command at level 2 or 5 is refused; a
-  grant for 2 does not open 5; a command at 3, 4, 7 or 8 is refused for
-  every guest; a manifest with a cap of 8 or a grant for level 1, 3 or 6
-  fails to load; a manifest that grants itself level 2 or level 5 without
-  the provenance P3 decides
-  ([ADR-0003](../adr/0003-wit-contract-push-model.md#priority-cap)) gets the
-  outcome P3 decides, tested before code.
+  instantiate; without a record, a command at level 2 or 5 is refused; a
+  record for 2 does not open 5; a command at 3, 4, 7 or 8 is refused for
+  every guest; a manifest with a cap of 8 or a request for level 1, 3 or 6
+  fails to load; a manifest that requests level 2 or 5 without a host record
+  for its digest fails to load; a host record for one digest of a plugin
+  does not load another digest of the same plugin; a guest holds a level 5
+  slot and its record is revoked: the slot is relinquished and COV fires, the
+  next command at 5 is refused, and its slots at 9 to 16 are unchanged.
 - **Boundary**: memory grown to exactly the `StoreLimits` cap, and one step
   past it traps and revokes the lease; the deadline at the tick before and
   after expiry, including a guest that returns from a slow host call; a
   replay test using fuel for a deterministic trap; queue at its bound; a cap
   of 9 accepts level 9 and refuses 8; a cap of 16 accepts 16 and refuses 15;
   caps of 0 and 17 fail to load; a guest that calls a fast host function in
-  a loop is stopped at the absolute deadline.
+  a loop is stopped at the absolute deadline; a manifest that requests
+  levels 2 and 5 with a host record for level 2 only fails to load.
 
 ## P4: Daemon
 

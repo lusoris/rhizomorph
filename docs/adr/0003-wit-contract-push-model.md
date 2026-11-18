@@ -123,23 +123,35 @@ caps the levels its guest may take:
 - **Declared cap.** Every plugin manifest declares the strongest level its
   guest may command, a number from 9 to 16. Without a declaration the cap is
   9, so the guest takes levels 9 to 16.
-- **Grants for 2 and 5.** A guest takes level 2 or level 5 only with an
-  explicit grant for that level in its manifest. A grant names one level; a
-  grant for 2 does not open 5, and the reverse.
-- **Two host checks.** The host checks the manifest when it loads the plugin
-  and refuses to load a cap outside 9 to 16 or a grant for any level other
-  than 2 or 5. It checks again on every `command-point` and
-  `relinquish-point` call: the level must be at or weaker than the cap, or
-  be a granted level.
+- **Grants for 2 and 5.** A plugin manifest may only request level 2 or
+  level 5; it cannot grant either. The grant is a host-side record made by
+  the installation administrator when the plugin is installed, bound to the
+  plugin's content digest. One record covers one level: a record for 2 does
+  not open 5, and the reverse.
+- **Two host checks.** At load, the host refuses a cap outside 9 to 16, a
+  level request for any level other than 2 or 5, or a request for level 2 or
+  5 without a matching host record for that plugin's digest (fail closed; a
+  record for one digest does not load another digest, so a new plugin build
+  needs a new record). On every `command-point` and `relinquish-point` call,
+  the level must be at or weaker than the cap, or be a requested level whose
+  host record still exists; revoking the record refuses the next command at
+  that level.
 - **Levels 3, 4, 7 and 8.** The guest type can express them, but no cap and
   no grant opens them, so the host refuses them for every guest.
-- **Level 1** stays outside the guest type, so no manifest can grant it.
+- **Level 1** stays outside the guest type, so no manifest can request it.
 
-Open, not decided by this record: who issues and approves a grant, whether a
-grant written in a plugin-supplied manifest is accepted, and which host
-check confirms its provenance. P3 decides these before it fixes the manifest
-syntax for the cap and the grants, which is written in P3 with the final WIT
-file ([`phases.md`](../plan/phases.md#p3-wasm-host)).
+Publisher-signed grants are not accepted; a later decision may add them only
+as an additional check after a stated key-handling design, never as a
+replacement for the host record. P3 fixes the manifest syntax, the host
+record format, and which digest algorithm covers which files, with the final
+WIT file ([`phases.md`](../plan/phases.md#p3-wasm-host)).
+
+Revoking a record also relinquishes every slot the guest holds at the
+revoked level, through the per-lease point index of
+[ADR-0002](0002-priority-array-and-leases.md#the-real-bound-of-revoke), and
+fires COV as a lease revoke does; its slots at other levels stay. An
+administrator who wants such a value kept commands it at that level as a
+writer outside the guest; ADR-0002 lists those writers as not yet decided.
 
 ## Consequences
 
@@ -150,14 +162,18 @@ file ([`phases.md`](../plan/phases.md#p3-wasm-host)).
   guest blocked in a host call; every host function needs its own timeout.
   Epoch interruption excludes the Winch compiler. A guest without level 1 can
   never perform a manual life-safety override. The priority cap adds one
-  manifest field, grants and two host checks, and a plugin that needs level
-  2 or 5 must say so in its manifest.
+  manifest field, level requests, a host record per plugin build made by the
+  administrator, and two host checks; a plugin that needs level 2 or 5 must
+  request it and needs its record at every new build.
 
 ## References
 
 - Design input by the operator, restated; no document is quoted.
 - Priority cap: owner decision (paraphrased; decision, 2026-11-18, guest
   priority cap), restated in [Priority cap](#priority-cap).
+- Grant provenance: derived from the priority cap decision (paraphrased;
+  decision, 2026-11-18, guest grant provenance), restated in
+  [Priority cap](#priority-cap).
 - Wasmtime tag v50.0.2, `crates/wasmtime/src/config.rs` (sha256
   fa5c06563662) and `crates/wasmtime/src/runtime/limits.rs` (sha256
   07d25368279a), checked 2026-11-18.
