@@ -3,16 +3,19 @@
 Local-first smart-home and building-automation engine: a Rust core with a
 SvelteKit interface.
 
-> **Status: founding.** This repository holds governance, licence and agent
-> rules only. There is no engine code and no release yet. The plan documents
-> and decision records arrive next under `docs/`; code follows them.
+> **Status: design.** The concept, the decision records (each with its status
+> in [`docs/adr/README.md`](docs/adr/README.md)) and the phase plan are under
+> [`docs/`](#documentation). There is no engine code and no release yet; code
+> follows the phase plan, starting with P1.
 
 ## Start here
 
 1. Read [Name](#name) for what the project is called and why.
 2. Read [What it is meant to become](#what-it-is-meant-to-become) for the
    goal and the three faults it sets out to avoid.
-3. To contribute, read [`CONTRIBUTING.md`](CONTRIBUTING.md), then run the
+3. Read [`docs/concept.md`](docs/concept.md) for the design, then
+   [`docs/plan/phases.md`](docs/plan/phases.md) for the order of work.
+4. To contribute, read [`CONTRIBUTING.md`](CONTRIBUTING.md), then run the
    repository gate once:
 
    ```bash
@@ -32,9 +35,10 @@ food away from the place it already feeds on.
 - **The honey fungus:** *Armillaria*, the honey fungus, spreads from tree to
   tree through the soil along its rhizomorphs. One *Armillaria ostoyae* in
   Oregon covers more than 8.8 square kilometres.
-- **Why this name:** the design borrows from fungal networks: sparse sensing,
-  a mesh of small nodes, and routing decided locally instead of by one
-  central process.
+- **Why this name:** an analogy, not a claim: like a fungal network, the
+  engine grows by adding small isolated parts and falls back to another path
+  when one fails. [`docs/fungal-mapping.md`](docs/fungal-mapping.md) lists
+  each part of the analogy and which ones have no component yet.
 
 Source for the biology: the Wikipedia articles "Mycelial cord" and
 "Armillaria", read 2026-11-18.
@@ -48,11 +52,14 @@ home-automation hubs, built to avoid three structural faults:
 | Fault in a typical hub | Intended answer |
 | :--- | :--- |
 | Every integration shares one process, so one fault stops all of them | Isolated tiers: a small kernel, native fieldbus workers, sandboxed plugins, sidecars |
-| The last writer to a point wins, whatever its importance | A priority array per point with leases, as building automation uses |
+| The last writer to an output wins, whatever its importance | A priority array per commandable output with leases, as building automation uses |
 | Each device driver is written by hand | Drivers generated from typed interface contracts |
 
-These are goals, not shipped behaviour. Each becomes a decision record under
-[`docs/adr/`](docs/adr/README.md) before any code implements it.
+These are goals, not shipped behaviour. The first two have decision records
+under [`docs/adr/`](docs/adr/README.md) (ADR-0001, ADR-0002) and phases in
+the plan. The third has neither yet: only plugin generation from OpenAPI
+definitions is named, as a later, unverified node in ADR-0003. Each goal
+gets a decision record before any code implements it.
 
 The design input is by the operator; the documents in this repository are
 written from it.
@@ -62,9 +69,14 @@ written from it.
 - [`docs/concept.md`](docs/concept.md): what rhizomorph is, the research behind
   it, prior art and what is still unverified.
 - [`docs/adr/`](docs/adr/README.md): decision records, from the tier model to
-  the UI stack.
+  the hardware repository.
 - [`docs/plan/phases.md`](docs/plan/phases.md): the phase plan, with exit
   checks.
+- [`docs/plan/hardware.md`](docs/plan/hardware.md): the hardware plan, stages
+  H0 to H3 with entry conditions and exit checks.
+- [`docs/plan/coverage-matrix.md`](docs/plan/coverage-matrix.md): device
+  classes across building types, the protocol each needs, and every gap with
+  its source.
 - [`docs/plan/design-defects.md`](docs/plan/design-defects.md): known defects
   of the design reference code and their fixes.
 - [`docs/fungal-mapping.md`](docs/fungal-mapping.md): how the name maps to

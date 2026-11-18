@@ -12,7 +12,7 @@ SPDX-License-Identifier: EUPL-1.2
 ## Context
 
 The daemon keeps two kinds of data. **State** is small and must be exact:
-point definitions, mappings, default priority values, and credentials. It is
+point definitions, mappings, relinquish defaults, and credentials. It is
 read at boot to rebuild the in-memory arena. **Telemetry** is the stream of
 COV events: large, append-heavy and tolerant of loss at a crash. One engine
 rarely suits both. This record restates a design input by the operator.
@@ -20,10 +20,16 @@ rarely suits both. This record restates a design input by the operator.
 ## Decision
 
 - **redb** holds state: point definitions, mappings, relinquish defaults
-  and default priority values ([ADR-0002](0002-priority-array-and-leases.md)),
-  and credentials. The daemon reads it at boot to rebuild the arena.
+  ([ADR-0002](0002-priority-array-and-leases.md)) and credentials. The daemon
+  reads it at boot to rebuild the arena.
+- **Commanded slots are not stored.** No lease survives a daemon restart, so
+  at boot every slot is empty and each output starts at its relinquish
+  default. Whether some commands must outlive a restart is open in
+  ADR-0002.
 - **fjall** takes the COV telemetry stream through an asynchronous pipeline
   fed by the broadcast channel of the kernel. The kernel never waits for it.
+  The channel is bounded (HISS-06). What happens when the pipeline falls
+  behind, and how many events may be lost, is decided and tested in P4.
 
 Versions checked on 2026-11-18 through the crates.io API: redb 4.6.0
 (2026-11-13, MIT OR Apache-2.0, MSRV 1.90); fjall 3.1.13 (2026-10-25,
@@ -37,8 +43,9 @@ source is `crates/redb-bench-compare/benches/lmdb_benchmark.rs`.
 
 - At commit a11e7ef089bb (2026-11-18T00:48:05Z) the README reports durations.
   Individual writes: redb 920 ms, fjall 3488 ms. `len()`: redb 0 ms, fjall
-  1181 ms. Bulk load: 17063 ms. Uncompacted size: 4.00 GiB. The design input
-  figures match this revision exactly.
+  1181 ms. Bulk load: redb 17063 ms, fjall 18619 ms. Uncompacted size: redb
+  4.00 GiB, fjall 1000.95 MiB. The design input figures match this revision
+  exactly.
 - At commit b3e8ab8ecfe0, the same night, the README reports rates instead.
   Individual writes: redb 1.11K txn/s, fjall 414. Small batch writes: fjall
   254K key/s, redb 79.2K. Writes without sync: fjall 595K, redb 88.9K.
@@ -53,8 +60,9 @@ written into it.
 
 ## Consequences
 
-- **Positive**: Each workload gets the engine that the evidence favours; a
-  slow telemetry write cannot delay a state transaction or the kernel.
+- **Positive**: Each workload gets the engine that the evidence favours. The
+  split is designed so that a slow telemetry write does not delay a state
+  transaction or the kernel; a negative test in P4 checks it.
 - **Negative**: Two engines mean two file formats, two recovery paths and two
   upgrade paths. Telemetry still in the pipeline can be lost at a crash. How
   credentials are protected at rest in redb is not decided. The decision may

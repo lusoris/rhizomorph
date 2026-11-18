@@ -18,9 +18,10 @@ Rhizomorph is a local-first smart-home and building-automation engine. It
 runs on your own hardware, keeps working without a cloud account, and reads
 and commands devices such as heating controllers, meters, lights and
 sensors. The core is written in Rust; the user interface is a SvelteKit
-application that talks to the engine over an API. Every device point has a
-16-level priority array, as building automation uses, so an urgent writer
-overrides a routine one instead of "last writer wins". Integrations run in
+application that talks to the engine over an API. Every commandable output
+has a 16-level priority array, as building automation uses, so an urgent
+writer overrides a routine one instead of "last writer wins"; inputs take
+telemetry directly ([ADR-0002](adr/0002-priority-array-and-leases.md)). Integrations run in
 four isolation tiers so that a faulty plugin cannot take the engine down
 ([ADR-0001](adr/0001-tier-model.md)).
 
@@ -69,22 +70,27 @@ Crates:
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | redb | 4.6.0 | 2026-11-13 | MIT OR Apache-2.0 | 1.90 | 2026-11-18 | state store ([ADR-0004](adr/0004-storage-split.md)) |
 | fjall | 3.1.13 | 2026-10-25 | MIT OR Apache-2.0 | 1.90.0 | 2026-11-18 | telemetry store |
-| wasmtime | 50.0.2 | 2026-11 | Apache-2.0 WITH LLVM-exception | 1.95.0 | 2026-11-18 | plugin host |
-| wasmtime-wasi | 50.0.2 | not recorded | Apache-2.0 WITH LLVM-exception | not recorded | 2026-11-18 | WASI 0.2 host side |
+| wasmtime | 50.0.2 | 2026-11-16 | Apache-2.0 WITH LLVM-exception | 1.97.0 | 2026-11-18 | plugin host |
+| wasmtime-wasi | 50.0.2 | 2026-11-16 | Apache-2.0 WITH LLVM-exception | 1.97.0 | 2026-11-18 | WASI 0.2 host side |
+| wasmtime-wasi-http | 50.0.2 | 2026-11-16 | Apache-2.0 WITH LLVM-exception | 1.97.0 | 2026-11-18 | outbound HTTP for plugins, later; not verified ([ADR-0003](adr/0003-wit-contract-push-model.md#capabilities)) |
 | wit-bindgen | 0.63.0 | 2026-10-14 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | not recorded | 2026-11-18 | guest bindings |
 | tokio-modbus | 0.17.0 | 2025-10-22 | MIT OR Apache-2.0 | 1.76 | 2026-11-18 | Modbus worker |
-| voltage_modbus | 1.1.0 | 2026-10-09 | MIT | not recorded | 2026-11-18 | alternative Modbus crate, not selected; 3338 downloads in total |
+| voltage_modbus | 1.1.0 | 2026-10-09 | MIT | 1.85.0 | 2026-11-18 | alternative Modbus crate, not selected; 3338 downloads in total |
 | rusty-bacnet | not on crates.io (HTTP 404) | v0.15.0 on GitHub, 2026-10-29 | MIT | rust-version 1.95 | 2026-11-18 | BACnet worker, later |
 | aimdb-knx-connector | 0.6.0 | 2026-11-03 | Apache-2.0 | 1.98.0 | 2026-11-18 | KNX worker, later; 149 downloads in total |
-| aimdb-core | 3.0.0 | 2026-11-03 | Apache-2.0 | not recorded | 2026-11-18 | same name prefix as aimdb-knx-connector; relation and use not verified |
+| aimdb-core | 3.0.0 | 2026-11-03 | Apache-2.0 | 1.98.0 | 2026-11-18 | same name prefix as aimdb-knx-connector; relation and use not verified |
 | rs-matter | 0.4.1 | 2026-09-17 | Apache-2.0 | 1.87 | 2026-11-18 | Matter worker, later |
-| rumqttc | 0.25.1 | 2025-11-21 | Apache-2.0 | not recorded | 2026-11-18 | MQTT worker, later |
-| rumqttd | 0.20.0 | 2025-09-29 | Apache-2.0 | not recorded | 2026-11-18 | MQTT, later; role not decided |
-| progenitor | 0.16.1 | 2026-11-15 | MPL-2.0 | not recorded | 2026-11-18 | plugin generation from OpenAPI |
-| solar-positioning | 0.7.2 | not recorded | MIT | not recorded | 2026-11-18 | listed in the check; use not decided |
+| rumqttc | 0.25.1 | 2025-11-21 | Apache-2.0 | 1.64.0 | 2026-11-18 | MQTT worker, later |
+| rumqttd | 0.20.0 | 2025-09-29 | Apache-2.0 | 1.70.0 | 2026-11-18 | MQTT, later; role not decided |
+| progenitor | 0.16.1 | 2026-11-15 | MPL-2.0 | 1.88 | 2026-11-18 | plugin generation from OpenAPI, later; not verified for `wasm32-wasip2` |
+| progenitor-client | 0.16.1 | 2026-11-15 | MPL-2.0 | 1.88 | 2026-11-18 | runtime crate of the code that `progenitor` generates |
+| solar-positioning | 0.7.2 | 2026-10-19 | MIT | 1.85 | 2026-11-18 | listed in the check; use not decided |
 
 Notes on the table:
 
+- The rows were read at 03:28 CET and read again at 08:43 CET. The second
+  read corrected the wasmtime MSRV (1.97.0, not 1.95.0) and filled the
+  release dates and MSRVs that the first read did not record.
 - The newest published wasmtime row is the 48.0.9 backport of 2026-11-16;
   the newest stable line is 50.0.2.
 - The name `rhizomorph` is free on crates.io (HTTP 404 at the same check).
@@ -119,8 +125,8 @@ What it costs:
   maintained.
 - **A BACnet stack outside crates.io.** `rusty-bacnet` is a git dependency
   until a crates.io release exists; the choice is made in the fieldbus phase.
-- **A wide MSRV spread.** From 1.76 (tokio-modbus) to 1.98.0
-  (aimdb-knx-connector). The layout scratch program used rustc 1.98.1. The
+- **A wide MSRV spread.** From 1.64.0 (rumqttc) to 1.98.0
+  (aimdb-knx-connector, aimdb-core). The layout scratch program used rustc 1.98.1. The
   workspace toolchain is not yet chosen.
 - **No numbers on own hardware.** The storage benchmark figures are the redb
   author's, on the author's hardware. Nothing about latency, memory use or
@@ -176,6 +182,8 @@ differs: it has no BACnet certification and no BACnet stack yet.
 For a home today, pick **Home Assistant**. It is Apache-2.0, released on
 2026-11-16 and has the largest community of the projects checked (92451
 stars). **openHAB** is the alternative if a Java platform is preferred.
+This pick rests on licence, release date and community size only; no
+feature comparison was made.
 
 For a commercial building today, pick an established building-automation
 product: **Niagara Framework** or **Desigo CC**. Desigo CC carries BTL
@@ -222,15 +230,20 @@ Unverified:
 - Feature overlap with homeCore, aimdb, Home Assistant and openHAB.
 - Versions of crates not listed in the tables, including the async runtime.
 - How credentials stored in redb are protected at rest.
+- Whether a client generated by `progenitor` builds for `wasm32-wasip2` and
+  reaches the network through `wasmtime-wasi-http`.
 
 Stale or corrected design claims:
 
 - `rusty-bacnet` v0.13.0 with 17 crates: stale. The release is v0.15.0 and
   the workspace holds more crates; it is not on crates.io.
 - aimdb v1.1.0: stale. The release is v3.0.0.
-- "Epoch fuel metering": a conflation of two Wasmtime mechanisms, corrected
-  in [ADR-0003](adr/0003-wit-contract-push-model.md).
-- "Revoke is O(1)": false for the reference design; see
+- Guest limits named as one metering that combines epochs and fuel
+  (paraphrased; design input, 2026-11-18, guest limits): a conflation of two
+  Wasmtime mechanisms, corrected in
+  [ADR-0003](adr/0003-wit-contract-push-model.md).
+- Revoke claimed to take constant time (paraphrased; design input,
+  2026-11-18, revoke bound): false for the reference design; see
   [`plan/design-defects.md`](plan/design-defects.md) and
   [ADR-0002](adr/0002-priority-array-and-leases.md).
 - The redb benchmark figures in the design input match the README at commit

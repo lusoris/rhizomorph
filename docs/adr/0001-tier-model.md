@@ -36,20 +36,24 @@ rule.
 - **Tier 0** holds only what must be correct and fast: an in-memory arena of
   points addressed by dense numeric ids. It is split into a `no_std` core
   crate and a separate `std` adapter that supplies the clock, locking and the
-  broadcast channel. The reference design declared `no_std` and still
-  imported `std` ([`plan/design-defects.md`](../plan/design-defects.md),
-  defect 1).
+  broadcast channel. The channel has a fixed capacity (HISS-06); what a
+  subscriber that lags behind loses is decided and tested in P4
+  ([ADR-0004](0004-storage-split.md)). The reference design declared
+  `no_std` and still imported `std`
+  ([`plan/design-defects.md`](../plan/design-defects.md), defect 1).
 - **Tier 1** runs native because fieldbus work needs low overhead and
   direct socket access. Device profiles are declarative TOML register maps.
   At start a worker registers each point with its deadband and writability,
   receives a point id and interns the string key once.
 - **Tier 2** is for code that the project does not review: cloud API
   plugins and user scripts. Capabilities are declared in a manifest, for
-  example outbound HTTP to one named host. Plugins can be generated from
-  OpenAPI definitions with `progenitor` (MPL-2.0) and `wit-bindgen`.
+  example outbound HTTP to one named host. Generating plugins from OpenAPI
+  definitions with `progenitor` (MPL-2.0) and `wit-bindgen` is a later node
+  and not verified ([ADR-0003](0003-wit-contract-push-model.md#capabilities)).
 - **Tier 3** is for work whose memory and CPU use would harm the daemon. The
   first transport is a Unix domain socket. Shared memory is named in the
-  design input and is not decided here.
+  design input and is not decided here. A sidecar runs as its own process,
+  but no limit on its memory or CPU is decided yet; phase P10 decides it.
 
 ### Trust boundary
 
@@ -71,8 +75,8 @@ rule.
   released automatically. The kernel can be tested without any network.
 - **Negative**: Four tiers mean four failure modes to test and document.
   Tier 1 gives no memory isolation. The `std` adapter is one more crate to
-  keep in step with the core. The sidecar protocol and its message format are
-  not yet designed.
+  keep in step with the core. The sidecar protocol, its message format and
+  its resource limits are not yet designed.
 
 ## References
 
