@@ -14,9 +14,11 @@ SPDX-License-Identifier: EUPL-1.2
 Tier 2 plugins are WebAssembly components, WASI 0.2, built for
 `wasm32-wasip2` and run on Wasmtime ([ADR-0001](0001-tier-model.md)). They
 need a contract with the host that is small, typed and hard to misuse. The
-design input by the operator also wrote "epoch fuel metering" for the
-guest limits. That wording merges two separate Wasmtime mechanisms; this
-record corrects it from the Wasmtime source at tag v50.0.2.
+design input by the operator also named the guest limits as a single
+metering that combines epochs and fuel (paraphrased; design input,
+2026-11-18, guest limits). Epochs and fuel are two separate Wasmtime
+mechanisms; this record corrects the design from the Wasmtime source at tag
+v50.0.2.
 
 ## Decision
 
@@ -45,25 +47,41 @@ Rules of the contract:
 - **Push, not poll.** A guest receives events only for points it returned
   from `init`. Queues are bounded per guest (HISS-06); the behaviour on
   overflow is decided and tested in P3.
+- **Point access is a capability.** Capabilities are deny by default (see
+  [Capabilities](#capabilities)), and using a point is one of them: a guest
+  may subscribe to, report or command only the points its manifest lists.
+  The host refuses a subscription from `init` and a `command-point`,
+  `relinquish-point` or `report-telemetry` call for any other point id. The
+  manifest syntax for the list is written in P3.
 - **The priority type excludes level 1 on purpose.** The enum offered to
   guests leaves out Manual-Life Safety. Guests never take level 1. The type
-  also leaves out level 6, which no plugin or schedule takes
+  also leaves out level 6, which no external writer takes
   ([ADR-0002](0002-priority-array-and-leases.md)). A request for a level the
   type cannot express is impossible to write, so no runtime check can be
-  skipped. The host still validates every level against `Priority` and the
-  manifest.
+  skipped. The host still validates every level against `Priority`. Whether
+  it also checks a level cap from the manifest is the
+  [open question](#open-question) below.
+- **Bounded guests.** The number of guest stores that run at once has a
+  fixed upper bound, set in P3 (HISS-06).
 
 ### Guest limits
 
-Two separate Wasmtime mechanisms exist, and the design uses them for
-different jobs.
+Four Wasmtime mechanisms bound a guest, and the design uses each for a
+different job.
 
 | Mechanism | Wasmtime item | Use in rhizomorph |
 | :--- | :--- | :--- |
 | Epoch interruption | `Config::epoch_interruption` (`config.rs` line 788): a global counter that the host increments | Wall-clock deadline of every guest call |
-| Memory cap | `StoreLimitsBuilder::memory_size(bytes)` (`limits.rs` line 238), attached with `Store::limiter` | Cap per store, a few MiB per instance; limits each linear memory individually |
+| Memory and count caps | `StoreLimitsBuilder` (`limits.rs`), attached with `Store::limiter`: `memory_size(bytes)` (line 238), `table_elements` (line 250), `instances` (line 260), `tables` (line 270), `memories` (line 280), `trap_on_grow_failure` (line 294) | A cap of a few MiB on each linear memory, a cap on table elements, and caps on the number of instances, tables and memories in a store, so a store's total memory is bounded; the values are set in P3 |
 | Async host functions | Host functions that await | Blocking calls such as network access, with a host-side timeout |
 | Fuel | `Config::consume_fuel` (`config.rs` line 643): instrumented code, deterministic, a store starts with no fuel | Only in replay tests that need a deterministic trap |
+
+`memory_size` limits each linear memory on its own, so a guest with several
+memories could otherwise use the cap several times over; the count caps
+close that gap. By default a `memory.grow` past the cap returns -1 and the
+guest keeps running. The host sets `trap_on_grow_failure(true)`, so a growth
+past the cap traps and the host revokes the lease. The Wasmtime
+documentation notes that this setting is not necessarily spec-compliant.
 
 Reasons, from the Wasmtime documentation at v50.0.2:
 
@@ -71,6 +89,9 @@ Reasons, from the Wasmtime documentation at v50.0.2:
   cases that need deterministic yielding or trapping.
 - Neither epochs nor fuel interrupt a guest that is blocked in a host call.
   The host therefore puts its own timeout on every async host function.
+- The epoch counter keeps advancing while a host call runs, so time spent in
+  a slow host call counts against the guest's deadline unless the host
+  resets the deadline after the call. P3 decides which and tests it.
 - Bulk instructions such as `memory.copy` check the epoch once, at their
   start. The documentation recommends bounding store memory with a
   `ResourceLimiter` for strict time limits; `StoreLimits` is one.
@@ -84,17 +105,21 @@ and the deadline in ticks are set in P3.
 ### Capabilities
 
 Capabilities are deny by default and declared in a manifest, for example
-outbound HTTP to one named host. Cloud API plugins can be generated from
-OpenAPI definitions with `progenitor` plus `wit-bindgen`; that is a later
-node, not part of P3.
+outbound HTTP to one named host, or the points a guest may use. Generating
+cloud API plugins from OpenAPI definitions with `progenitor` plus
+`wit-bindgen` is a later node, not part of P3. Whether that route works is
+not verified: no source was found showing a `progenitor` client (which
+depends on `progenitor-client` 0.16.1, MPL-2.0) built for `wasm32-wasip2`
+and reaching the network through `wasmtime-wasi-http` 50.0.2.
 
 ### Open question
 
 Must a plugin manifest also cap the highest level a guest may take? The
 guest type allows levels 2 and 5, which the standard assigns to life safety
-and critical equipment. A manifest cap would stop an untrusted plugin from
-overriding those levels without an explicit grant. Not decided; it blocks the
-final WIT file in P3.
+and critical equipment. With a cap, a plugin takes those levels only with an
+explicit grant, at the cost of one more manifest field and host check.
+Without one, the guest type alone bounds the levels. Not decided; it blocks
+the final WIT file in P3.
 
 ## Consequences
 
@@ -114,4 +139,7 @@ final WIT file in P3.
   07d25368279a), checked 2026-11-18.
 - [`docs/concept.md`](../concept.md): wasmtime 50.0.2, wasmtime-wasi 50.0.2,
   wit-bindgen 0.63.0, progenitor 0.16.1.
+- crates.io API, `wasmtime-wasi-http` 50.0.2 (2026-11-16, Apache-2.0 WITH
+  LLVM-exception) and `progenitor-client` 0.16.1 (2026-11-15, MPL-2.0),
+  checked 2026-11-18T08:39:59+01:00.
 - [`docs/plan/design-defects.md`](../plan/design-defects.md), defect 8.

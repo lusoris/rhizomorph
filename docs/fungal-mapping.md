@@ -34,7 +34,7 @@ cannot be separated. It is not evidence for a hidden optimizer.
 | :--- | :--- | :--- | :--- |
 | Branching: a network grows out to reach more sources | Reach of the fieldbus workers: a new protocol worker adds a branch to the engine ([ADR-0001](adr/0001-tier-model.md), tier 1) | Planned from P2 | Analogy |
 | Anastomosis: hyphae fuse into alternative paths | Alternative paths between a point and its writers or sources; fallback paths | Not designed; no component exists | Analogy |
-| Cord thickening on use and regression of low-value regions | An adaptive topology that favours used paths and drops idle ones; candidate `001-adaptive-topology.md` | Not designed; no component exists | Analogy |
+| Cord thickening on use and regression of low-value regions | An adaptive topology that favours used paths and drops idle ones | Not designed; no component exists | Analogy |
 | Damage plugging: a damaged part is sealed off | Lease revoke and tier isolation: a failed plugin's slots are cleared and the fault stays in its tier ([ADR-0001](adr/0001-tier-model.md), [ADR-0002](adr/0002-priority-array-and-leases.md)) | Planned in P1 and P3 | Analogy |
 | Later bypass: flow finds a way around a blocked part | Fallback to the next priority slot when a slot is cleared ([ADR-0002](adr/0002-priority-array-and-leases.md)) | Planned in P1 | Analogy |
 

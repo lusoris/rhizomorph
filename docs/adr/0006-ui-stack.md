@@ -27,14 +27,16 @@ by the operator.
   place that authenticates a UI session and gives it a lease
   ([ADR-0002](0002-priority-array-and-leases.md)); a UI session therefore
   writes at the priorities the daemon allows it, and its commands end with
-  its lease.
+  its lease. How a session that disappears without closing loses its lease,
+  and whether a user command must outlive the session, are open in
+  [ADR-0002](0002-priority-array-and-leases.md#leases).
 - The API protocol and its schema are not decided here; they are a P4 task.
   The UI phase P5 builds on the P4 API.
 
 ## Consequences
 
 - **Positive**: The UI can fail, restart or be replaced without touching the
-  kernel; a closed browser session releases its commands.
+  kernel; a session that closes releases its commands.
 - **Negative**: `sveltesentio` is at version 0.9.0, so its interface can
   still change. The daemon API becomes a contract that needs its own
   versioning and tests.
