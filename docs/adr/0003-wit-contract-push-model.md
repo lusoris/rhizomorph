@@ -92,7 +92,10 @@ Reasons, from the Wasmtime documentation at v50.0.2:
 - Epochs run faster than fuel: "in some measurements, up to 2-3x". Fuel is for
   cases that need deterministic yielding or trapping.
 - Neither epochs nor fuel interrupt a guest that is blocked in a host call.
-  The host therefore puts its own timeout on every async host function.
+  The host therefore puts its own timeout on every async host function. A
+  blocked host call ends at the earlier of its own host timeout and the
+  absolute guest deadline, so the deadline stays absolute. How the host
+  cancels the call is P3 work ([`phases.md`](../plan/phases.md#p3-wasm-host)).
 - The epoch counter keeps advancing while a host call runs, so time spent in
   a host call counts against the guest's wall-clock deadline. That deadline
   is absolute and is never reset after a host call; if P3 also keeps a
@@ -154,22 +157,29 @@ WIT file ([`phases.md`](../plan/phases.md#p3-wasm-host)).
 Revoking a record also relinquishes every slot the guest holds at the
 revoked level, through the per-lease point index of
 [ADR-0002](0002-priority-array-and-leases.md#the-real-bound-of-revoke), and
-fires COV as a lease revoke does; its slots at other levels stay. An
-administrator who wants such a value kept commands it at that level as a
-writer outside the guest; ADR-0002 lists those writers as not yet decided.
+fires COV as a lease revoke does; its slots at other levels stay. The host
+holds one lock across the grant-record check and the kernel write of a
+`command-point` or `relinquish-point` call; revoking a record takes the same
+lock before it relinquishes the slots, so no command checked before a revoke
+writes a slot at the revoked level afterwards. Grants stay on the host side;
+the kernel API does not change. Lock contention is measured in P3
+([`phases.md`](../plan/phases.md#p3-wasm-host)). An administrator who wants
+such a value kept commands it at that level as a writer outside the guest;
+ADR-0002 lists those writers as not yet decided.
 
 ## Consequences
 
 - **Positive**: A guest cannot hold, leak or guess a lease. Time and memory
   are bounded by separate mechanisms with stated limits. The corrected
   wording avoids a configuration that never enabled fuel.
-- **Negative**: The deadline protects against code running, not against a
-  guest blocked in a host call; every host function needs its own timeout.
-  Epoch interruption excludes the Winch compiler. A guest without level 1 can
-  never perform a manual life-safety override. The priority cap adds one
-  manifest field, level requests, a host record per plugin build made by the
-  administrator, and two host checks; a plugin that needs level 2 or 5 must
-  request it and needs its record at every new build.
+- **Negative**: Neither epochs nor fuel stop a guest blocked in a host call,
+  so every host function needs its own timeout and the host must cancel a
+  call at the absolute deadline. Epoch interruption excludes the Winch
+  compiler. A guest without level 1 can never perform a manual life-safety
+  override. The priority cap adds one manifest field, level requests, a host
+  record per plugin build made by the administrator, and two host checks; a
+  plugin that needs level 2 or 5 must request it and needs its record at
+  every new build. The grant lock puts one lock on the guest command path.
 
 ## References
 
