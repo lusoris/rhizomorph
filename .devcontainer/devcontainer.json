@@ -1,0 +1,52 @@
+{
+  "name": "lusoris/rhizomorph",
+  "build": {
+    "dockerfile": "Dockerfile.praetor",
+    "context": "."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": false,
+      "upgradePackages": true
+    },
+    "ghcr.io/devcontainers/features/docker-in-docker:4": {},
+    "ghcr.io/devcontainers/features/go:1": {
+      "installGoTools": false,
+      "version": "1.27"
+    }
+  },
+  "customizations": {
+    "praetor": {
+      "bootstrap": {
+        "version": 1,
+        "state": "source-bundle",
+        "builderImage": "docker.io/library/golang@sha256:eb61c3873c97416fff0116553fff65d67a3549f72e11d9758849a689cdd8b523",
+        "baseImage": "mcr.microsoft.com/devcontainers/base@sha256:91eff046d5c12318fc98e59258982b87ba896c467427ed8b5dab5a02107a5db7",
+        "golangciLintVersion": "v2.15.0",
+        "sourceSHA256": "sha256:6c9c9319195616afc4584ca5a8e065e385cd3401e78700667957a16a1fb677d1",
+        "archiveSHA256": "sha256:92525076c71cb4b2d102b9d547699c6834d821877762629314ea30f316e868ae",
+        "archiveParts": 8,
+        "dockerfileSHA256": "sha256:1798184ff7d2c563a12e45ba41f6fb185342ec34cbf1e023c604de1896960a0b"
+      }
+    },
+    "vscode": {
+      "extensions": [
+        "GitHub.vscode-pull-request-github",
+        "aquasecurity.trivy-vulnerability-scanner",
+        "eamodio.gitlens",
+        "github.copilot",
+        "golang.go"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "go.lintOnSave": "package",
+        "go.lintTool": "golangci-lint",
+        "go.toolsManagement.autoUpdate": false,
+        "go.useLanguageServer": true,
+        "security.workspace.trust.enabled": true
+      }
+    }
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "export PATH=\"/usr/local/bin:$PATH\"; /usr/local/bin/praetorctl compile-context && /usr/bin/make verify-all"
+}
