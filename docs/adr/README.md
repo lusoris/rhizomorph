@@ -14,3 +14,5 @@ record that supersedes it.
 | [0004](0004-storage-split.md) | 2026-11-18 | Storage split between redb and fjall | Proposed |
 | [0005](0005-licence.md) | 2026-11-18 | Project licence and dependency licences | Proposed |
 | [0006](0006-ui-stack.md) | 2026-11-18 | User interface stack | Proposed |
+| [0008](0008-hardware-licence.md) | 2026-11-18 | Hardware licence | Accepted |
+| [0009](0009-hardware-repository.md) | 2026-11-18 | Hardware repository | Accepted |
