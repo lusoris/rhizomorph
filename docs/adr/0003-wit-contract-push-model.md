@@ -89,8 +89,11 @@ Reasons, from the Wasmtime documentation at v50.0.2:
 - Neither epochs nor fuel interrupt a guest that is blocked in a host call.
   The host therefore puts its own timeout on every async host function.
 - The epoch counter keeps advancing while a host call runs, so time spent in
-  a slow host call counts against the guest's deadline unless the host
-  resets the deadline after the call. P3 decides which and tests it.
+  a host call counts against the guest's wall-clock deadline. That deadline
+  is absolute and is never reset after a host call; if P3 also keeps a
+  budget of guest execution time that excludes host calls, it tracks that
+  budget separately and under the absolute deadline
+  ([`phases.md`](../plan/phases.md#p3-wasm-host)).
 - Bulk instructions such as `memory.copy` check the epoch once, at their
   start. The documentation recommends bounding store memory with a
   `ResourceLimiter` for strict time limits; `StoreLimits` is one.
@@ -132,8 +135,11 @@ caps the levels its guest may take:
   no grant opens them, so the host refuses them for every guest.
 - **Level 1** stays outside the guest type, so no manifest can grant it.
 
-The manifest syntax for the cap and the grants is written in P3, with the
-final WIT file.
+Open, not decided by this record: who issues and approves a grant, whether a
+grant written in a plugin-supplied manifest is accepted, and which host
+check confirms its provenance. P3 decides these before it fixes the manifest
+syntax for the cap and the grants, which is written in P3 with the final WIT
+file ([`phases.md`](../plan/phases.md#p3-wasm-host)).
 
 ## Consequences
 

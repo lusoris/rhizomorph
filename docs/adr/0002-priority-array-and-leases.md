@@ -57,9 +57,9 @@ edition is not verified.
 | Level | Standard name | Status | Rhizomorph use |
 | :--- | :--- | :--- | :--- |
 | 1 | Manual-Life Safety | assigned by the standard | Never taken by a guest ([ADR-0003](0003-wit-contract-push-model.md)) |
-| 2 | Automatic-Life Safety | assigned by the standard | A guest only with an explicit manifest grant ([ADR-0003](0003-wit-contract-push-model.md#priority-cap)); writers beyond guests not yet decided |
+| 2 | Automatic-Life Safety | assigned by the standard | A guest only with an explicit manifest grant ([ADR-0003](0003-wit-contract-push-model.md#priority-cap), grant provenance open there); writers beyond guests not yet decided |
 | 3, 4 | Available | free | Unassigned; refused for every guest ([ADR-0003](0003-wit-contract-push-model.md#priority-cap)) |
-| 5 | Critical Equipment Control | assigned by the standard | A guest only with an explicit manifest grant ([ADR-0003](0003-wit-contract-push-model.md#priority-cap)); writers beyond guests not yet decided |
+| 5 | Critical Equipment Control | assigned by the standard | A guest only with an explicit manifest grant ([ADR-0003](0003-wit-contract-push-model.md#priority-cap), grant provenance open there); writers beyond guests not yet decided |
 | 6 | Minimum On/Off | assigned by the standard | Reserved for the minimum on and off time algorithm of an object; refused for every external writer |
 | 7 | Available | free | Unassigned; refused for every guest ([ADR-0003](0003-wit-contract-push-model.md#priority-cap)) |
 | 8 | Manual Operator | assigned by the standard | Proposed for user commands; refused for every guest ([ADR-0003](0003-wit-contract-push-model.md#priority-cap)) |
@@ -103,9 +103,10 @@ Proposed lease rules that phase P1 turns into tests before code:
 Open, not decided by this record:
 
 - **A write to a slot that another lease holds.** Lease B commands a level at
-  which lease A already holds the slot. Either B takes the slot and A's index
-  entry for that point is dropped (a BACnet write at a level replaces the
-  value there), or the write is refused. P1 decides it in a test before code.
+  which lease A already holds the slot. Either B takes the slot (a BACnet
+  write at a level replaces the value there), and A's index entry for that
+  point is removed only when A then holds no other slot on that point, or the
+  write is refused. P1 decides it in a test before code.
 - **A writer that hangs without failing.** A worker stuck in a loop or a UI
   client that disappears without closing its session keeps its lease, and
   its commands stay in force. A guest blocked in a host call is ended by the
@@ -138,8 +139,11 @@ a lease that holds few points among many.
 
 The arena, the lease table and the per-lease index each have a fixed
 capacity, set when the kernel starts. P1 names the values and tests each at
-its limit. A registration or lease request past a limit is refused, and
-nothing on the ingress or resolve path allocates (HISS-03, HISS-06).
+its limit. A registration or lease request past a limit is refused, and a
+command that needs a new per-lease index entry while that lease's index is
+full is refused before it changes any slot, so revoke still clears every
+slot the lease holds. Nothing on the ingress or resolve path allocates
+(HISS-03, HISS-06).
 
 ### Layout measurement
 
@@ -176,9 +180,12 @@ Proposed definitions that phase P1 turns into tests before code:
   `f64` of the same magnitude.
 - A deadband is an absolute threshold, finite and not negative, checked at
   registration. It applies to telemetry of `i64`, `f64` and `u16` inputs.
-- A telemetry update fires a COV event when it differs from the last
-  reported value and the difference is equal to or greater than the
-  threshold. Otherwise it is dropped and fires no event.
+- A telemetry update fires a COV event when it differs from the value of the
+  last COV event (the last reported value, not the present value) and the
+  difference is equal to or greater than the threshold. A below-threshold
+  telemetry update still sets the input's present value and fires no COV
+  event (for example, threshold 1, last reported 0, update 0.5 sets the
+  present value to 0.5 and fires no event).
 - With a threshold of 0.0, every update that differs fires, and an identical
   value never does.
 - "Differs" for `f64` means IEEE 754 inequality, so `-0.0` and `0.0` are the

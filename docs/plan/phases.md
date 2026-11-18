@@ -87,12 +87,13 @@ Exit check, all five pass:
 Tests:
 
 - **Positive**: lowest level number wins; relinquishing the winning slot
-  falls back to the next slot; a deadband update below the threshold fires
-  no COV event and one at or above it does; the first update of a point
-  fires; revoke of a lease clears every slot it holds and fires COV for each
-  value that changed; the last relinquish sets the relinquish default and
-  fires COV; a write to a slot that does not win fires no COV; the core
-  takes time only as a value passed in by the adapter.
+  falls back to the next slot; a deadband update below the threshold changes
+  the present value and fires no COV event, and one at or above it fires
+  COV; the first update of a point fires; revoke of a lease clears every
+  slot it holds and fires COV for each value that changed; the last
+  relinquish sets the relinquish default and fires COV; a write to a slot
+  that does not win fires no COV; the core takes time only as a value passed
+  in by the adapter.
 - **Negative**: NaN and infinities refused at ingress; `Priority` 0 and 17
   refused; level 6 refused for every external writer; a lease cannot clear
   another lease's slot; a write under a revoked lease refused; revoking a
@@ -108,7 +109,8 @@ Tests:
   `i64::MAX`; the arena, lease table and per-lease index each at capacity;
   the size assertion `PriorityArray` = 384 bytes on x86_64 (not promised on
   32-bit targets); revoke of a lease that holds one point among many visits
-  only that point.
+  only that point; a command to a new point when the lease's index is at
+  capacity is refused and leaves every slot unchanged.
 - A write to a slot that another lease holds, and a writer that hangs
   without failing: P1 decides both
   ([ADR-0002](../adr/0002-priority-array-and-leases.md#leases)) and tests
@@ -144,13 +146,17 @@ Decisions: [ADR-0003](../adr/0003-wit-contract-push-model.md). Defect fixed: 8
   instantiate; without a grant, a command at level 2 or 5 is refused; a
   grant for 2 does not open 5; a command at 3, 4, 7 or 8 is refused for
   every guest; a manifest with a cap of 8 or a grant for level 1, 3 or 6
-  fails to load.
+  fails to load; a manifest that grants itself level 2 or level 5 without
+  the provenance P3 decides
+  ([ADR-0003](../adr/0003-wit-contract-push-model.md#priority-cap)) gets the
+  outcome P3 decides, tested before code.
 - **Boundary**: memory grown to exactly the `StoreLimits` cap, and one step
   past it traps and revokes the lease; the deadline at the tick before and
   after expiry, including a guest that returns from a slow host call; a
   replay test using fuel for a deterministic trap; queue at its bound; a cap
   of 9 accepts level 9 and refuses 8; a cap of 16 accepts 16 and refuses 15;
-  caps of 0 and 17 fail to load.
+  caps of 0 and 17 fail to load; a guest that calls a fast host function in
+  a loop is stopped at the absolute deadline.
 
 ## P4: Daemon
 
