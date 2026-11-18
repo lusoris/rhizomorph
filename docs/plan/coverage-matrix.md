@@ -109,13 +109,13 @@ or an `H1` bridge to Modbus or MQTT ([`hardware.md`](hardware.md#stages)).
 | 10 | Environment sensing (temperature, humidity, light) | **Modbus RTU/TCP** (`V1.1b3`); **BACnet** (`ASHRAE 135`); **KNX** (`ISO/IEC 14543-3`); **Matter** (`1.4 / 1.6`); **Thread** (`1.3.0 / 1.4`); **Zigbee 3.0** (`IEEE 802.15.4-2020`); **BLE** (`Bluetooth 5.x` advertisements); **LoRaWAN** (`1.0.4 / 1.1`); **MQTT** (`v3.1.1 / v5.0`) | Covered for **Modbus** (`P2`), **BACnet** (`P6`), **KNX** (`P7`), **Matter** (`P8`), and **MQTT** (`P9`). **No worker** for native Zigbee, BLE, or LoRaWAN ([Gap 1](#gaps), [Gap 8](#gaps)). | `H0` RS-485 Modbus, KNX, and Matter sensors; `H1` ESPHome, Tasmota, Zigbee2MQTT, and ChirpStack LoRaWAN-to-MQTT bridges (`P9`). |
 | 11 | Leak and water shut-off | **Modbus RTU** (`V1.1b3`); **KNX** (`ISO/IEC 14543-3`); **Matter** (`1.4 / 1.6` Water Freeze/Leak Detector and Valve Configuration and Control clusters); **Zigbee 3.0** (`IEEE 802.15.4-2020`); **LoRaWAN** (`1.0.4 / 1.1`); **MQTT** (`v3.1.1 / v5.0`) | Covered for **Modbus** (`P2`), **KNX** (`P7`), **Matter** (`P8`), and **MQTT** (`P9`). **No worker** for native Zigbee or LoRaWAN ([Gap 1](#gaps), [Gap 8](#gaps)). | `H0` motorized brass ball valves with local dry-contact / Modbus / Shelly MQTT control; `H1` Zigbee2MQTT and LoRaWAN battery leak probes bridged to MQTT (`P9`). |
 | 12 | Alarm and security | **Modbus RTU/TCP** (`V1.1b3`); **BACnet** (`ASHRAE 135`); **KNX** (`ISO/IEC 14543-3`); **OSDP** (`IEC 60839-11-5`); **SNMPv3** (`IETF STD 62` / `RFC 3411–3418`); **MQTT** (`v3.1.1 / v5.0`) | Covered for **Modbus** (`P2`), **BACnet** (`P6`), **KNX** (`P7`), and **MQTT** (`P9`). **No worker** for **OSDP** ([Gap 6](#gaps)), **SNMPv3** ([Gap 11](#gaps)), or `EN 50131` intrusion panel buses. | `H0` supervised dry-contact zone inputs on Modbus/KNX I/O modules; `H1` ESPHome / MQTT bridges for legacy panel serial buses. |
-| 13 | Life safety (smoke, fire, CO) | **EN 14604** (standalone smoke alarms); **EN 54** series (commercial fire detection and fire alarm systems); **EN 50291-1** (domestic CO alarms); auxiliary read-only telemetry via **BACnet/IP or MS/TP** (`ASHRAE 135` Life Safety Point/Zone), **Modbus RTU/TCP** (`V1.1b3`), **KNX** (`ISO/IEC 14543-3`), **Zigbee 3.0**, or dry-contact relay bases | Covered for read-only status ingestion over **Modbus** (`P2`), **BACnet** (`P6`), **KNX** (`P7`), **Matter** (`P8`), and **MQTT** (`P9`). Priority levels 1 and 2 (`Manual-Life Safety`, `Automatic-Life Safety`) are reserved in [ADR-0002](../adr/0002-priority-array-and-leases.md). | **Certified off-the-shelf (`H0`) only; never an own `H2` design** ([`hardware.md`](hardware.md#purpose-and-scope)). Commercial `EN 54` fire panels expose read-only BACnet or Modbus gateways; residential `EN 14604` / `EN 50291-1` alarms expose certified relay bases or Zigbee/KNX status modules ([Gap 7](#gaps)). |
+| 13 | Life safety (smoke, fire, CO) | **EN 14604** (standalone smoke alarms); **EN 54** series (commercial fire detection and fire alarm systems); **EN 50291-1** (domestic CO alarms); auxiliary read-only telemetry via **BACnet/IP or MS/TP** (`ASHRAE 135` Life Safety Point/Zone), **Modbus RTU/TCP** (`V1.1b3`), **KNX** (`ISO/IEC 14543-3`), **Zigbee 3.0**, or dry-contact relay bases | Covered for read-only status ingestion into input points over **Modbus** (`P2`), **BACnet** (`P6`), **KNX** (`P7`), **Matter** (`P8`), and **MQTT** (`P9`). Priority levels 1 and 2 (`Manual-Life Safety`, `Automatic-Life Safety`) in [ADR-0002](../adr/0002-priority-array-and-leases.md) apply only to commandable outputs (writers for level 2 remain open). | **Certified off-the-shelf (`H0`) only; never an own `H2` design** ([`hardware.md`](hardware.md#purpose-and-scope)). Commercial `EN 54` fire panels expose read-only BACnet or Modbus gateways; residential `EN 14604` / `EN 50291-1` alarms expose certified relay bases or Zigbee/KNX status modules ([Gap 7](#gaps)). |
 | 14 | Irrigation and weather | **Modbus RTU** (`V1.1b3`, RS-485 soil moisture/EC/temperature probes and ultrasonic anemometers); **LoRaWAN** (`LoRaWAN L2 1.0.4 / 1.1`); **SDI-12** (`SDI-12 v1.4` environmental sensors); **MQTT** (`v3.1.1 / v5.0`); **Matter** (`1.4 / 1.6`) | Covered for **Modbus** (`P2`), **Matter** (`P8`), and **MQTT** (`P9`). **No worker** for **LoRaWAN** or **SDI-12** ([Gap 8](#gaps)). | `H0` RS-485 Modbus weather stations, soil probes, and 24 V AC solenoid valve manifolds on Modbus/MQTT relays; `H1` LoRaWAN-to-MQTT gateway for long-range field valves and probes. |
 | 15 | Livestock and barn climate | **Modbus RTU/TCP** (`V1.1b3` for ammonia $\text{NH}_3$, $\text{CO}_2$, $\text{H}_2\text{S}$ electrochemical/NDIR transmitters, variable-frequency fan drives, curtain actuators); **LoRaWAN** (`1.0.4 / 1.1`); **ISOBUS** (`ISO 11783` / **SAE J1939** over **CAN** `ISO 11898-1`); **MQTT** (`v3.1.1 / v5.0`) | Covered for **Modbus** (`P2`) and **MQTT** (`P9`). **No worker** for **LoRaWAN** ([Gap 8](#gaps)) or **CAN / SAE J1939 / ISO 11783** ([Gap 9](#gaps)). | `H0` industrial IP65+ RS-485 Modbus ammonia/climate transmitters and VFDs; `H2` candidate for a ruggedised IP65+ PoE/RS-485/CAN barn controller carrier board ([Gap 13](#gaps)). |
 | 16 | Workshop and industrial machines | **OPC UA** (`IEC 62541` series); **Modbus RTU/TCP** (`V1.1b3`); **CAN / CANopen** (`ISO 11898-1` / `CiA 301`); **MQTT** / **Sparkplug B** (`OASIS MQTT v3.1.1 / v5.0`, `ISO/IEC 20922`) | Covered for **Modbus** (`P2`) and **MQTT** (`P9`). **No worker** for **OPC UA IEC 62541** ([Gap 10](#gaps)) or **CAN** ([Gap 9](#gaps)). | `H0` PLCs, CNC controllers, VFD spindle/pump drives, and compressed-air meters supporting Modbus TCP/RTU; native OPC UA requires a new worker or Tier 3 sidecar ([Gap 10](#gaps)). |
 | 17 | Data room power and cooling (PDU, UPS, cooling units) | **SNMP** (`SNMPv3`, `IETF STD 62` / `RFC 3411–3418`); **Modbus RTU/TCP** (`V1.1b3`); **BACnet/IP** (`ASHRAE 135`); **Redfish** (`DMTF DSP0266`); **MQTT** (`v3.1.1 / v5.0`) | Covered for **Modbus** (`P2`), **BACnet** (`P6`), and **MQTT** (`P9`). **No worker** for **SNMPv3** ([Gap 11](#gaps)) or Redfish. | `H0` rack PDUs, precision CRAC/in-row cooling units, and commercial UPS units with Modbus TCP or BACnet/IP cards; `H1` Network UPS Tools (`networkupstools/nut`, GPL-2.0+) bridging USB/SNMP UPS state to MQTT (`P9`). |
-| 18 | Vehicle and boat systems | **CAN** (`ISO 11898-1:2024` / `ISO 11898-2:2024`); **SAE J1939** (heavy vehicles/generators over 29-bit CAN); **NMEA 2000** (`IEC 61162-3` over CAN); **NMEA 0183** (`IEC 61162-1` serial ASCII); **Signal K** (`Signal K Specification v1.7.0` JSON over HTTP/WebSocket); **Victron VE.Direct / Modbus TCP** (`V1.1b3`); **MQTT** (`v3.1.1 / v5.0`) | Covered for **Modbus** (`P2`) and **MQTT** (`P9`). **No worker** for **CAN**, **SAE J1939**, **NMEA 2000 IEC 61162-3**, **NMEA 0183 IEC 61162-1**, or **Signal K** ([Gap 9](#gaps)). | `H0` marine/RV inverter-chargers exposing Modbus TCP; `H1` open Signal K server (`SignalK/specification`, Apache-2.0) on Linux with isolated SocketCAN adaptor bridging NMEA 2000, NMEA 0183, and J1939 to MQTT (`P9`). |
-| 19 | Precise positioning (RTK GNSS base and rover antennas, UWB, BLE direction finding) | **RTCM 3.x** (`RTCM 10403.3 / 10403.4`) over **NTRIP v2.0** (`RTCM 10410.1`) and **NMEA 0183** (`IEC 61162-1`); **UWB** (`IEEE Std 802.15.4z-2020` HRP/LRP PHY/MAC and **FiRa Consortium** `PHY/MAC Technical Specification 2.0`); **Bluetooth 5.1+ Direction Finding** (`Bluetooth Core Specification v5.1+`, Constant Tone Extension `CTE` for **AoA** and **AoD**); **MQTT** (`v3.1.1 / v5.0`) | Covered only after positioning engines publish coordinates or ranges to **MQTT** (`P9`) or **Modbus** (`P2`). **No worker** for **RTCM 3.x / NTRIP**, **NMEA 0183**, **IEEE 802.15.4z / FiRa UWB**, or **Bluetooth 5.1 AoA/AoD** IQ processing ([Gap 12](#gaps)). | `H0`/`H1` RTK GNSS base stations via `Stefal/rtkbase` (GPL-3.0) with u-blox `ZED-F9P` modules; `H1`/`H2` UWB boards using Qorvo `DWM3000`; `H2` gap for open PoE ceiling anchors combining UWB and BLE AoA antenna arrays ([Gap 12](#gaps)). |
+| 18 | Vehicle and boat systems | **CAN** (`ISO 11898-1:2024` / `ISO 11898-2:2024`); **SAE J1939** (heavy vehicles/generators over 29-bit CAN); **NMEA 2000** (`IEC 61162-3` over CAN); **NMEA 0183** (`IEC 61162-1` serial ASCII); **Signal K** (`Signal K Specification v1.7.0` JSON over HTTP/WebSocket); **Victron VE.Direct / Modbus TCP** (`V1.1b3`); **MQTT** (`v3.1.1 / v5.0`) | Covered for **Modbus** (`P2`) and **MQTT** (`P9`). **No worker** for **CAN**, **SAE J1939**, **NMEA 2000 IEC 61162-3**, **NMEA 0183 IEC 61162-1**, or **Signal K** ([Gap 9](#gaps)). | `H0` marine/RV inverter-chargers exposing Modbus TCP; `H1` open Signal K server (`SignalK/signalk-server`, Apache-2.0, implementing `SignalK/specification`, CC-BY-SA-2.0) on Linux with isolated SocketCAN adaptor bridging NMEA 2000, NMEA 0183, and J1939 to MQTT (`P9`). |
+| 19 | Precise positioning (RTK GNSS base and rover antennas, UWB, BLE direction finding) | **RTCM 3.x** (`RTCM 10403.3 / 10403.4`) over **NTRIP v2.0** (`RTCM 10410.1`) and **NMEA 0183** (`IEC 61162-1`); **UWB** (`IEEE Std 802.15.4z-2020` HRP/LRP PHY/MAC and **FiRa Consortium** `PHY/MAC Technical Specification 2.0`); **Bluetooth 5.1+ Direction Finding** (`Bluetooth Core Specification v5.1+`, Constant Tone Extension `CTE` for **AoA** and **AoD**); **MQTT** (`v3.1.1 / v5.0`) | Covered only after positioning engines publish coordinates or ranges to **MQTT** (`P9`) or **Modbus** (`P2`). **No worker** for **RTCM 3.x / NTRIP**, **NMEA 0183**, **IEEE 802.15.4z / FiRa UWB**, or **Bluetooth 5.1 AoA/AoD** IQ processing ([Gap 12](#gaps)). | `H0`/`H1` RTK GNSS base stations via `Stefal/rtkbase` (AGPL-3.0; modified network services carry a Section 13 Corresponding Source offer) with u-blox `ZED-F9P` modules plus an NTRIP/TCP-to-MQTT bridge; `H1`/`H2` `DS-TWR` UWB boards using Qorvo `DWM3000` (internal 38.4 MHz crystal) or `TDoA` anchors using `DW3000` with a 38.4 MHz TCXO; `H2` gap for open PoE ceiling anchors combining UWB and BLE AoA antenna arrays ([Gap 12](#gaps)). |
 
 ## Precise positioning
 
@@ -129,20 +129,23 @@ technologies are required.
 | Attribute | RTK GNSS (`RTCM 10403.3 / 10403.4` + `NTRIP 10410.1`) | Ultra-Wideband (`IEEE 802.15.4z-2020` + `FiRa 2.0`) | BLE Direction Finding (`Bluetooth 5.1+` `AoA` / `AoD`) |
 | :--- | :--- | :--- | :--- |
 | **Primary measurement principle** | Dual/multi-band carrier-phase differential satellite ranging against a stationary local base station | Picosecond Time-of-Flight (ToF) via Two-Way Ranging (`SS-TWR` / `DS-TWR`), Time Difference of Arrival (`TDoA`), or Phase Difference of Arrival (`PDoA`) | Phase difference of a 2.4 GHz Constant Tone Extension (`CTE`) across a multi-antenna RF switch array (`AoA` at locator, `AoD` at tag) |
-| **Accuracy class and required conditions** | **$0.01\text{ m} + 1\text{ ppm}$ CEP horizontal**, $\approx 0.01\text{--}0.02\text{ m} + 1\text{ ppm}$ vertical in RTK Fixed mode (u-blox `ZED-F9P` datasheet); requires unobstructed sky view, multi-constellation L1/L2 or L1/L5 carrier lock, low multipath, and base-to-rover baseline $< 10\text{--}20\text{ km}$ | **$\pm 0.10\text{ m}$ ranging precision** ($\pm 5^\circ$ angular on PDoA variants; Qorvo `DW3000`/`DWM3000` datasheet); requires line-of-sight on UWB Channel 5 (6489.6 MHz) or Channel 9 (7987.2 MHz) and per-board antenna delay calibration | **$\approx 2^\circ\text{--}5^\circ$ angular resolution, yielding $0.10\text{--}0.50\text{ m}$ positional accuracy** (Nordic `nRF52833`/`nRF5340` and Silicon Labs `EFR32BG22` documentation); requires line-of-sight to ceiling/wall antenna arrays, elevation outside the flat-array grazing cone, and multipath filtering (such as MUSIC/ESPRIT) |
-| **Indoor / outdoor limits** | **Outdoor only.** Satellite signals arrive near $-130\text{ dBm}$; roofs, concrete floors, and metal barn/workshop siding block line-of-sight or induce severe carrier-phase multipath, losing RTK Fix indoors. | **Indoor and short-range outdoor ($10\text{--}50\text{ m}$ per cell).** Wideband 500 MHz pulses resolve direct paths from wall reflections; requires **3 non-collinear anchors per room** for 2D position or **4 non-coplanar anchors per room** for 3D position. | **Indoor room and corridor scale.** Multi-year coin-cell tag life in `AoA` mode; requires multi-element antenna arrays ($\le \lambda/2 \approx 62\text{ mm}$ spacing at 2.4 GHz) and **1 locator per zone** (bearing/presence) or **2–4 locators per room** (triangulated 2D/3D coordinates). |
+| **Accuracy class and required conditions** | **$0.01\text{ m} + 1\text{ ppm}$ CEP horizontal and $0.01\text{ m} + 1\text{ ppm}$ CEP vertical** in RTK mode (u-blox `ZED-F9P-01B` Data sheet `UBX-17051259 - R09`, Table 2); requires unobstructed sky view (`HDOP < 3.0`), multi-constellation L1/L2 or L1/L5 carrier lock, low multipath, and a base-to-rover baseline below the receiver's long-baseline warning (above 100 km; 50 km with firmware `HPG 1.12`; `ZED-F9P` Integration manual `UBX-18010802 - R16`, Section 3.1.5.4.2 and footnote 9) | **$\pm 0.06\text{ m}$ typical calibrated ranging accuracy** ($\pm 0.10\text{ m}$ module specification; $\pm 10^\circ$ PDoA / $\pm 5^\circ$ computed AoA on PDoA variants; Qorvo `DW3000` Datasheet `v1.1` Table 14 and `DWM3000` Data Sheet `Rev B` p. 1); requires line-of-sight on UWB Channel 5 (`6489.6 MHz`) or Channel 9 (`7987.2 MHz`) and per-board antenna delay calibration | **"A couple of degrees" angular accuracy and $\approx 0.5\text{ m}$ positioning accuracy** (Silicon Labs `Bluetooth Direction Finding Fundamentals` `v0.1`, p. 5/13; Nordic `nRF52833` `v1.3` / `nRF5340` `v1.2` and Silicon Labs `EFR32BG22` `Rev. 1.0` specifications); requires line-of-sight to ceiling/wall antenna arrays and multipath filtering (such as spatial smoothing with MUSIC or ESPRIT) |
+| **Indoor / outdoor limits** | **Outdoor only.** The data sheet states its acquisition figures for satellites received at $-130\text{ dBm}$ (`UBX-17051259 - R09` Table 1, note 3); roofs, concrete floors, and metal barn/workshop siding block line-of-sight or induce severe carrier-phase multipath, losing RTK Fix indoors. | **Indoor and short-range outdoor.** Wideband `499.2–500 MHz` pulses (`DW3000` `v1.1` Table 11, `DWM3000` `Rev B` Table 6) resolve direct paths from wall reflections; requires **3 non-collinear anchors per room** for 2D position or **4 non-coplanar anchors per room** for 3D position. | **Indoor room and corridor scale.** Multi-year coin-cell tag life in `AoA` mode; requires multi-element antenna arrays ($\le \lambda/2 \approx 0.0625\text{ m} = 62.5\text{ mm}$ spacing at 2.4 GHz, `Bluetooth Direction Finding Fundamentals` `v0.1` p. 4/13) and **1 locator per zone** (bearing/presence) or **multiple locators per room** (triangulated 2D/3D coordinates, p. 11/13). |
 | **Building types where it applies** | `Farm and barn` (outdoor yards, autonomous tractors, pasture virtual fencing), `outdoor and garden` (robotic mowers, boundary survey, irrigation mapping), `vehicles and boats` (vessel position, docking, attitude/heading), `house` / `office` / `workshop` (roof-mounted stationary RTK base station) | `Hospital` (infusion pump, crash cart, and bed tracking), `workshop and industrial` (forklift/AGV safety zones, torque-tool localisation), `farm and barn` (indoor robotic scraper/feeder navigation and livestock stall tracking), `office` (secure zone access) | `Hospital` (high-volume disposable/coin-cell asset and patient/staff badges), `office` and `school` (asset tracking and indoor wayfinding), `workshop and industrial` (pallet, tote, and tool crib tracking), `farm and barn` (ear-tag livestock zone presence) |
 | **Protocols** | `RTCM 10403.3 / 10403.4` (messages 1005/1006, MSM4/MSM7 1074/1077, 1084/1087, 1094/1097, 1124/1127, 1230), `NTRIP v2.0` (`RTCM 10410.1`), `NMEA 0183` (`IEC 61162-1`), u-blox `UBX`, bridged to `MQTT` (`P9`) | `IEEE Std 802.15.4z-2020` (BPRF/HPRF modes with scrambled timestamp sequence `STS`), `FiRa Consortium PHY/MAC 2.0`, bridged over Ethernet/Wi-Fi to `MQTT` (`P9`) | `Bluetooth Core Specification v5.1+` Connectionless or Connection-Oriented `CTE` (`AoA`/`AoD`), Zephyr Bluetooth Direction Finding API, bridged to `MQTT` (`P9`) |
-| **Documented modules and open designs** | Module: u-blox `ZED-F9P` (multi-band L1/L2 RTK receiver). Open base station software/design: `Stefal/rtkbase` (GPL-3.0) running on a single-board computer with a roof survey antenna. | Module: Qorvo `DWM3000` (certified module around `DW3000` IC, `IEEE 802.15.4z` / FiRa compliant). Open hardware reference: `Makerfabs/Makerfabs-ESP32-UWB-DW3000`. | SoCs/modules: Nordic `nRF52833`, `nRF5340` (with Zephyr RTOS `direction_finding` samples) and Silicon Labs `EFR32BG22` (reference $4 \times 4$ patch array `BRD4185A`). |
+| **Documented modules and open designs** | Module: u-blox `ZED-F9P` (multi-band L1/L2 or L1/L5 RTK receiver). Open base station software/design: `Stefal/rtkbase` (AGPL-3.0; modified network services carry a Section 13 source offer) running on a single-board computer with a roof survey antenna. | Module/IC: Qorvo `DWM3000` (certified module around `DW3110` IC with internal 38.4 MHz crystal for `TWR`) and Qorvo `DW3000` (`DW3110`/`DW3120` IC supporting an external 38.4 MHz `TCXO` for `TDoA` anchors). Open hardware reference: `Makerfabs/Makerfabs-ESP32-UWB-DW3000`. | SoCs/modules: Nordic `nRF52833`, `nRF5340` (with Zephyr RTOS `direction_finding` samples) and Silicon Labs `EFR32BG22` (reference $4 \times 4$ patch array `BRD4185A`). |
 
 ### 1. RTK GNSS (Real-Time Kinematic Global Navigation Satellite System)
 
 - **Base station and rover antenna types:**
   - **Base station:** Requires a fixed, vibration-free roof or mast mount with
-    an unobstructed $360^\circ$ sky view above $10^\circ\text{--}15^\circ$
-    elevation and a multi-band (L1/L2/L5) Right-Hand Circularly Polarised (RHCP)
-    geodetic survey antenna, choke-ring antenna, or Survey-grade patch antenna
-    with an integrated ground plane to reject ground-reflected multipath.
+    an unobstructed sky view (`HDOP < 3.0` as in the go/no-go test of
+    `UBX-18010802 - R16` Section 3.19.2, and a configurable minimum satellite
+    elevation mask `CFG-NAVSPG-INFIL_MINELEV`, Section 3.1.8.2) and a
+    multi-band (L1/L2/L5) Right-Hand Circularly Polarised (RHCP) geodetic
+    survey antenna, choke-ring antenna, or survey-grade patch antenna with an
+    integrated ground plane ($\ge 100\text{--}150\text{ mm}$ diameter for patch
+    elements, Section 4.8.4) to reject multipath.
   - **Rover:** Uses a multi-band active patch antenna over a metal vehicle/robot
     roof ground plane or a multi-band helical antenna on handheld or small
     robotic rovers. Dual-antenna moving-baseline rovers provide true GNSS
@@ -152,12 +155,18 @@ technologies are required.
   carrier-phase observation streams (Station ARP message `1005`/`1006` and
   Multiple Signal Messages `MSM4`/`MSM7`: GPS `1074`/`1077`, GLONASS
   `1084`/`1087` + `1230`, Galileo `1094`/`1097`, BeiDou `1124`/`1127`), and
-  publishes them via a local `NTRIP v2.0` (`RTCM 10410.1`) caster (`Stefal/rtkbase`),
-  local TCP socket, `MQTT` (`P9`), or a local sub-GHz radio link to rovers on
-  the property without needing a paid external cloud NTRIP service.
+  serves them through `Stefal/rtkbase` (`AGPL-3.0`; under Section 13 of the
+  licence, any modified version operated as a network service must offer its
+  Corresponding Source to remote users). `Stefal/rtkbase` (`README.md` lines
+  13 and 260–275) provides RTKLIB `str2str` services for an external NTRIP
+  caster client, a local `NTRIP v2.0` (`RTCM 10410.1`) caster, a TCP `RTCM`
+  server, a serial/radio `RTCM` link, raw file logging, and `gpsd` NMEA
+  forwarding, without needing a paid external cloud NTRIP service.
 - **Gaps:** Rhizomorph has no native NTRIP caster/client or `NMEA 0183` /
-  `RTCM 3.x` worker; rovers and base stations currently bridge through
-  `Stefal/rtkbase` and `MQTT` (`P9`) ([Gap 12](#gaps)).
+  `RTCM 3.x` worker, and `Stefal/rtkbase` does not include an MQTT publisher;
+  connecting base-station status or rover `NMEA 0183` / `UBX` fixes to `MQTT`
+  (`P9`) therefore requires an additional `NTRIP`/TCP/`gpsd`-to-`MQTT` bridge
+  ([Gap 12](#gaps)).
 
 ### 2. Ultra-Wideband (UWB, `IEEE 802.15.4z-2020` and `FiRa 2.0`)
 
@@ -181,9 +190,13 @@ technologies are required.
   with heavy metallic obstructions (industrial machine bays, hospital imaging
   suites, steel livestock stalls) require 4 to 6 anchors per zone so at least 3
   anchors maintain line-of-sight (`LoS`) simultaneously.
-- **Gaps:** While development boards (`Makerfabs/Makerfabs-ESP32-UWB-DW3000`)
-  exist for `TWR` prototyping, there is no open-hardware PoE ceiling anchor with
-  TCXO clock sync and an open `TWR`/`TDoA`-to-MQTT solver ready for `H1`
+- **Gaps:** Development boards (`Makerfabs/Makerfabs-ESP32-UWB-DW3000`) use the
+  Qorvo `DWM3000` module (`Rev B`, Section 1.1 and Table 2), which seals an
+  internal 38.4 MHz crystal under its RF shield and exposes no external clock
+  input pin, making it suitable for `DS-TWR` but not external-TCXO `TDoA`
+  anchors; there is no open-hardware PoE ceiling anchor with a 38.4 MHz
+  `TCXO`-clocked `DW3000` IC (`DW3000` Datasheet `v1.1`, Table 10) and wired or
+  wireless clock sync, nor an open `TWR`/`TDoA`-to-MQTT solver ready for `H1`
   adoption ([Gap 12](#gaps)).
 
 ### 3. Bluetooth 5.1+ Direction Finding (`AoA` and `AoD`)
@@ -203,7 +216,8 @@ technologies are required.
     privately without transmitting location beacons.
 - **Antenna arrays:** Require $N$-element patch or dipole arrays (such as a
   $4 \times 4$ uniform rectangular array or circular array) with inter-element
-  spacing $\le \lambda/2$ at 2.4 GHz ($\approx 62\text{ mm}$), controlled by low-insertion-loss
+  spacing $\le \lambda/2$ at 2.4 GHz ($\approx 0.0625\text{ m} = 62.5\text{ mm}$,
+  `Bluetooth Direction Finding Fundamentals` `v0.1` p. 4/13), controlled by
   GPIO RF switches defined in the MCU DeviceTree (Nordic `nRF52833` / `nRF5340`
   under Zephyr RTOS or Silicon Labs `EFR32BG22`).
 - **Gaps:** No open-source, calibrated 2.4 GHz $4 \times 4$ patch antenna array
@@ -298,12 +312,18 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
    - **What is missing:** Standardised `H0` TOML device profiles for commercial
      `EN 54` fire alarm panel BACnet/Modbus status gateways and residential
      `EN 14604` / `EN 50291-1` relay/Zigbee status bases, mapped to read-only
-     inputs or `Automatic-Life Safety` priority level 2 ([ADR-0002](../adr/0002-priority-array-and-leases.md)).
+     input points (whose present value is written directly by telemetry under
+     [ADR-0002](../adr/0002-priority-array-and-leases.md)). Any interlock that
+     commands a separate commandable output point at `Automatic-Life Safety`
+     priority level 2 is a separate design decision, as priority arrays belong
+     only to commandable outputs and writers for level 2 remain open in
+     [ADR-0002](../adr/0002-priority-array-and-leases.md).
    - **Affected cells:** Class 13 (Life safety) across all building types except
      `outdoor and garden`.
    - **Source:** [`docs/adr/0002-priority-array-and-leases.md`](../adr/0002-priority-array-and-leases.md)
-     lines 47–68 and EU Construction Products Regulation `Regulation (EU) No
-     305/2011` / `EN 14604` / `EN 54` (verified via web search 2026-11-18).
+     lines 26–35 and 47–68, and EU Construction Products Regulation `Regulation
+     (EU) No 305/2011` / `EN 14604` / `EN 54` (verified via web search
+     2026-11-18).
 
 8. **No native LoRaWAN (`LoRaWAN L2 1.0.4 / 1.1`) or `SDI-12` (`v1.4`) worker.**
    - **What is missing:** Rhizomorph worker or `H1` local LoRaWAN network server
@@ -324,9 +344,11 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
      climate), Class 16 (Workshop and industrial machines), and Class 18
      (Vehicle and boat systems) in `farm and barn`, `workshop and industrial`,
      and `vehicles and boats`.
-   - **Source:** [`docs/concept.md`](../concept.md) lines 68–82 and
+   - **Source:** [`docs/concept.md`](../concept.md) lines 68–82;
      <https://raw.githubusercontent.com/SignalK/specification/master/LICENSE>
-     (read 2026-11-18).
+     (`CC-BY-SA-2.0`); and
+     <https://raw.githubusercontent.com/SignalK/signalk-server/master/LICENSE>
+     (`Apache-2.0`, all read 2026-11-18).
 
 10. **No native OPC UA (`IEC 62541`) worker.**
     - **What is missing:** Rhizomorph Tier 1 worker or Tier 3 sidecar
@@ -356,17 +378,34 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
       1. Rhizomorph Tier 1/3 positioning ingestion and coordinate-frame worker
          handling `RTCM 3.x` / `NTRIP v2.0` health, `NMEA 0183` / `UBX` fix
          quality, UWB `TWR`/`TDoA` multilateration, and BLE `AoA`/`AoD` angle
-         triangulation.
-      2. An `H2` open-hardware PoE ceiling anchor carrier board combining a
-         pre-certified Qorvo `DWM3000` UWB module (with low-drift TCXO for
-         `TDoA`) and a Nordic `nRF52833` / `nRF5340` or Silicon Labs `EFR32BG22`
-         BLE 5.1 Direction Finding receiver with a calibrated 2.4 GHz $4 \times 4$
-         patch antenna array.
+         triangulation, plus an `H1` bridge from `Stefal/rtkbase` (`NTRIP` /
+         TCP `RTCM` / `gpsd` streams, as `rtkbase` has no built-in MQTT
+         publisher) into `MQTT` (`P9`).
+      2. An `H2` open-hardware PoE ceiling anchor board combining UWB ranging
+         and a Nordic `nRF52833` / `nRF5340` or Silicon Labs `EFR32BG22` BLE
+         5.1+ Direction Finding receiver with a calibrated 2.4 GHz $4 \times 4$
+         patch antenna array: either a pre-certified Qorvo `DWM3000` module
+         (which uses a sealed internal 38.4 MHz crystal and has no external
+         clock input pin, limiting the board to `DS-TWR` or crystal-trimmed
+         operation) or a chip-down Qorvo `DW3000` (`DW3110`/`DW3120`) transceiver
+         driven by an AC-coupled 38.4 MHz `TCXO` (`DW3000` Datasheet `v1.1`,
+         Table 10) with wired or wireless anchor clock synchronisation for
+         `TDoA` (requiring full RED Article 3(2) radio testing).
     - **Affected cells:** Class 19 (Precise positioning) across `office`,
       `hospital`, `farm and barn`, `workshop and industrial`, `outdoor and
       garden`, and `vehicles and boats`.
     - **Source:** [`docs/concept.md`](../concept.md) lines 68–82;
-      <https://raw.githubusercontent.com/Stefal/rtkbase/master/LICENSE>;
+      <https://raw.githubusercontent.com/Stefal/rtkbase/master/LICENSE>
+      (`AGPL-3.0`);
+      <https://raw.githubusercontent.com/Stefal/rtkbase/master/README.md>
+      (lines 13 and 260–275);
+      <https://download.mikroe.com/documents/datasheets/DWM3000_datasheet.pdf>
+      (`Rev B`, May 2021; third-party copy; vendor site refused CLI fetch on
+      2026-11-18);
+      <https://datasheet.lcsc.com/datasheet/pdf/e06f26519d4502e7d7a9bf99fdb1e852.pdf?productCode=C3294486>
+      (`DW3000` Datasheet `v1.1`, 24 March 2021; third-party copy; vendor site
+      refused CLI fetch on 2026-11-18);
+      <https://forum.qorvo.com/t/dwm3000-tdoa-example/11432>;
       <https://github.com/Makerfabs/Makerfabs-ESP32-UWB-DW3000>;
       <https://www.firaconsortium.org/>;
       <https://www.bluetooth.com/learn-about-bluetooth/feature-enhancements/direction-finding/>
@@ -453,8 +492,10 @@ Every source below was checked on **2026-11-18**:
   - Open Supervised Device Protocol (`IEC 60839-11-5`, `goToMain/libosdp`):
     <https://raw.githubusercontent.com/goToMain/libosdp/master/LICENSE> (read
     2026-11-18)
-  - Signal K marine specification (`SignalK/specification`):
-    <https://raw.githubusercontent.com/SignalK/specification/master/LICENSE>
+  - Signal K marine specification (`SignalK/specification`, `CC-BY-SA-2.0`) and
+    server (`SignalK/signalk-server`, `Apache-2.0`):
+    <https://raw.githubusercontent.com/SignalK/specification/master/LICENSE> and
+    <https://raw.githubusercontent.com/SignalK/signalk-server/master/LICENSE>
     (read 2026-11-18)
   - Network UPS Tools (`networkupstools/nut`):
     <https://github.com/networkupstools/nut> (read 2026-11-18)
@@ -472,22 +513,48 @@ Every source below was checked on **2026-11-18**:
     2026-11-18)
   - Shelly local API documentation: <https://shelly-api-docs.shelly.cloud/>
     (read 2026-11-18)
-- **Precise positioning specifications, modules, and open designs (checked on
-  2026-11-18):**
-  - `Stefal/rtkbase` open GNSS RTK base station (`RTCM 10403.3` / `NTRIP
-    10410.1`): <https://raw.githubusercontent.com/Stefal/rtkbase/master/LICENSE>
-    (fetched via HTTP 200 on 2026-11-18)
+- **Precise positioning specifications, modules, and open designs (fetched via
+  HTTP 200 on 2026-11-18):**
+  - `Stefal/rtkbase` open GNSS RTK base station (`AGPL-3.0`, `RTCM 10403.3` /
+    `NTRIP 10410.1`):
+    <https://raw.githubusercontent.com/Stefal/rtkbase/master/LICENSE> and
+    <https://raw.githubusercontent.com/Stefal/rtkbase/master/README.md> (read
+    2026-11-18)
   - FiRa Consortium (`IEEE 802.15.4z` UWB PHY/MAC):
-    <https://www.firaconsortium.org/> (fetched via HTTP 200 on 2026-11-18)
-  - Open ESP32 + Qorvo `DW3000` UWB hardware reference:
-    <https://github.com/Makerfabs/Makerfabs-ESP32-UWB-DW3000> (fetched via HTTP
-    200 on 2026-11-18)
+    <https://www.firaconsortium.org/> (read 2026-11-18)
+  - Open ESP32 + Qorvo `DWM3000` UWB hardware reference:
+    <https://github.com/Makerfabs/Makerfabs-ESP32-UWB-DW3000> (read 2026-11-18)
   - Bluetooth SIG Direction Finding (`Bluetooth 5.1+ AoA / AoD`):
     <https://www.bluetooth.com/learn-about-bluetooth/feature-enhancements/direction-finding/>
-    (fetched via HTTP 200 on 2026-11-18)
-  - u-blox `ZED-F9P` datasheet/integration manual ($0.01\text{ m} + 1\text{ ppm}$
-    CEP RTK Fixed accuracy, `RTCM 10403.3 / 10403.4` messages), Qorvo `DW3000` /
-    `DWM3000` datasheet ($\pm 0.10\text{ m}$ ranging precision, `IEEE 802.15.4z`
-    Channels 5 and 9), and Nordic `nRF52833` / `nRF5340` and Silicon Labs
-    `EFR32BG22` Bluetooth 5.1 Direction Finding specifications (verified via
-    grounded web search on 2026-11-18)
+    (read 2026-11-18)
+  - u-blox `ZED-F9P-01B Data sheet` (`UBX-17051259 - R09`, 24 March 2023):
+    <https://content.u-blox.com/sites/default/files/documents/ZED-F9P-01B_DataSheet_UBX-17051259.pdf>
+    (read 2026-11-18)
+  - u-blox `ZED-F9P Integration manual` (`UBX-18010802 - R16`, 30 October 2024):
+    <https://content.u-blox.com/sites/default/files/ZED-F9P_IntegrationManual_UBX-18010802.pdf>
+    (read 2026-11-18)
+  - Qorvo `DW3000 Datasheet` (`Version 1.1`, 24 March 2021; third-party copy;
+    vendor site refused CLI fetch on 2026-11-18):
+    <https://datasheet.lcsc.com/datasheet/pdf/e06f26519d4502e7d7a9bf99fdb1e852.pdf?productCode=C3294486>
+    (read 2026-11-18)
+  - Qorvo `DWM3000 Data Sheet` (`Rev B`, May 2021) and Qorvo Tech Forum `TDoA`
+    clock guidance (post #3, 4 January 2022); the data sheet link is a
+    third-party copy; vendor site refused CLI fetch on 2026-11-18:
+    <https://download.mikroe.com/documents/datasheets/DWM3000_datasheet.pdf> and
+    <https://forum.qorvo.com/t/dwm3000-tdoa-example/11432> (read 2026-11-18)
+  - Nordic Semiconductor `nRF52833 Product Specification` (`v1.3`, document
+    `4452_021 v1.3`, 7 August 2020; third-party copy; vendor site refused CLI fetch on 2026-11-18):
+    <https://fgcoca.github.io/Guia-de-trabajo-para-microbit/datasheet/nRF52833.pdf>
+    (read 2026-11-18)
+  - Nordic Semiconductor `nRF5340 Product Specification` (`v1.2`, document
+    `4406_640 v1.2`, 30 September 2021; third-party copy; vendor site refused CLI fetch on 2026-11-18):
+    <https://datasheet.lcsc.com/datasheet/pdf/6efcc39a770f71ab97f60efc3494de83.pdf?productCode=C3606967>
+    (read 2026-11-18)
+  - Silicon Labs `EFR32BG22 Wireless Gecko SoC Family Data Sheet` (`Rev. 1.0`;
+    third-party copy; vendor site refused CLI fetch on 2026-11-18):
+    <https://datasheet.lcsc.com/datasheet/pdf/841f42e0d4c7698aab75a7c0ae34fc4f.pdf?productCode=C1015249>
+    (read 2026-11-18)
+  - Silicon Labs `Bluetooth Direction Finding Fundamentals` (`v0.1`, replacing
+    `UG103.18`) and `Bluetooth Location Services / RTL Library` (`v11.1.2`):
+    <https://docs.silabs.com/bluetooth-direction-finding-fundamentals/0.1/bluetooth-direction-finding-fundamentals.pdf>
+    and <https://docs.silabs.com/rtl-lib/11.1.2/rtl-lib.pdf> (read 2026-11-18)
