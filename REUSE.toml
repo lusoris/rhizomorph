@@ -13,6 +13,8 @@ path = [
     "README.md",
     ".gitignore",
     "renovate.json",
+    "Cargo.lock",
+    "tests/deny-planted/Cargo.lock",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"

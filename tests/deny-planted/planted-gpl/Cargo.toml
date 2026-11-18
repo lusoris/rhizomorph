@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Planted negative fixture crate: carries a disallowed GPL-3.0-only licence
+# in Cargo metadata so cargo-deny rejects it against root deny.toml, while the
+# files in this repository remain EUPL-1.2 under REUSE.
+
+[package]
+name = "planted-gpl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "GPL-3.0-only"
+publish = false
