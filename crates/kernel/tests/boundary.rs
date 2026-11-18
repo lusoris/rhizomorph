@@ -135,6 +135,24 @@ fn difference_exactly_equal_to_threshold_fires_f64_and_i64() {
     );
 }
 
+/// An `i64` update one below the deadband sets the present value and fires nothing.
+#[test]
+fn i64_update_one_below_threshold_sets_present_value_and_fires_nothing() {
+    let mut k = Kernel::new(Capacities::default());
+    let signed_pt = k.register_input(ValueKind::I64, Some(5.0)).unwrap();
+    let mut events = Vec::new();
+
+    k.telemetry(signed_pt, Value::I64(10), &mut |e| events.push(e))
+        .unwrap();
+    assert_eq!(k.present_value(signed_pt).unwrap(), Some(Value::I64(10)));
+    assert_eq!(events.len(), 1);
+
+    k.telemetry(signed_pt, Value::I64(14), &mut |e| events.push(e))
+        .unwrap();
+    assert_eq!(k.present_value(signed_pt).unwrap(), Some(Value::I64(14)));
+    assert_eq!(events.len(), 1);
+}
+
 /// -0.0 after 0.0 fires nothing, because the two compare equal.
 #[test]
 fn negative_zero_after_positive_zero_fires_nothing() {

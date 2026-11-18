@@ -367,6 +367,7 @@ impl core::error::Error for KernelError {}
 struct InputPoint {
     kind: ValueKind,
     deadband: Option<f64>,
+    present_value: Option<Value>,
     last_reported: Option<Value>,
 }
 
@@ -459,7 +460,8 @@ impl Kernel {
     }
 
     /// Returns the current present value of `point` (`None` if an input has not yet
-    /// received its first telemetry update).
+    /// received its first telemetry update; for inputs, reflects every accepted
+    /// telemetry update, even when inside the deadband).
     ///
     /// # Errors
     ///
@@ -470,7 +472,7 @@ impl Kernel {
             .get(point.0 as usize)
             .ok_or(KernelError::UnknownPoint)?;
         match entry {
-            Point::Input(inp) => Ok(inp.last_reported),
+            Point::Input(inp) => Ok(inp.present_value),
             Point::Output(out) => Ok(Some(out.present_value)),
         }
     }
@@ -506,6 +508,7 @@ impl Kernel {
         self.push_point(Point::Input(InputPoint {
             kind,
             deadband,
+            present_value: None,
             last_reported: None,
         }))
     }
@@ -528,8 +531,9 @@ impl Kernel {
         }))
     }
 
-    /// Applies an input telemetry reading and emits [`CovEvent`] when the first
-    /// value arrives or when the change reaches the configured deadband.
+    /// Applies an input telemetry reading, setting the input's present value on every
+    /// accepted update and emitting [`CovEvent`] when the first value arrives or when the
+    /// change from the last reported value reaches the configured deadband.
     ///
     /// # Errors
     ///
@@ -554,6 +558,7 @@ impl Kernel {
         if inp.kind != value.kind() {
             return Err(KernelError::KindMismatch);
         }
+        inp.present_value = Some(value);
         if should_emit_telemetry(inp.last_reported, value, inp.deadband) {
             inp.last_reported = Some(value);
             sink(CovEvent { point, value });

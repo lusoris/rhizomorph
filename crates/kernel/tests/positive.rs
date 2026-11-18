@@ -98,7 +98,8 @@ fn relinquish_winning_slot_falls_back_to_next_slot() {
     );
 }
 
-/// Exit check, positive: an update inside the deadband fires no COV event; one at or past it fires.
+/// Exit check, positive: an update inside the deadband sets the present value and fires no COV
+/// event; one at or past it fires.
 #[test]
 fn deadband_below_threshold_fires_nothing_at_and_above_fires() {
     let mut k = Kernel::new(Capacities::default());
@@ -110,7 +111,7 @@ fn deadband_below_threshold_fires_nothing_at_and_above_fires() {
     k.telemetry(inp, Value::F64(21.5), &mut |e| events.push(e))
         .unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(k.present_value(inp).unwrap(), Some(Value::F64(20.0)));
+    assert_eq!(k.present_value(inp).unwrap(), Some(Value::F64(21.5)));
 
     k.telemetry(inp, Value::F64(22.0), &mut |e| events.push(e))
         .unwrap();
@@ -121,6 +122,47 @@ fn deadband_below_threshold_fires_nothing_at_and_above_fires() {
         .unwrap();
     assert_eq!(events.len(), 3);
     assert_eq!(k.present_value(inp).unwrap(), Some(Value::F64(19.0)));
+}
+
+/// Updates below the deadband set the present value without firing COV, and later updates compare
+/// against the last reported value.
+#[test]
+fn deadband_sets_present_value_and_compares_against_last_reported() {
+    let mut k = Kernel::new(Capacities::default());
+    let mut events = Vec::new();
+    let inp = k.register_input(ValueKind::F64, Some(1.0)).unwrap();
+
+    k.telemetry(inp, Value::F64(0.0), &mut |e| events.push(e))
+        .unwrap();
+    assert_eq!(k.present_value(inp).unwrap(), Some(Value::F64(0.0)));
+    assert_eq!(events.len(), 1);
+
+    k.telemetry(inp, Value::F64(0.5), &mut |e| events.push(e))
+        .unwrap();
+    assert_eq!(k.present_value(inp).unwrap(), Some(Value::F64(0.5)));
+    assert_eq!(events.len(), 1);
+
+    k.telemetry(inp, Value::F64(1.2), &mut |e| events.push(e))
+        .unwrap();
+    assert_eq!(k.present_value(inp).unwrap(), Some(Value::F64(1.2)));
+    assert_eq!(events.len(), 2);
+
+    k.telemetry(inp, Value::F64(1.5), &mut |e| events.push(e))
+        .unwrap();
+    assert_eq!(k.present_value(inp).unwrap(), Some(Value::F64(1.5)));
+    assert_eq!(
+        events,
+        vec![
+            CovEvent {
+                point: inp,
+                value: Value::F64(0.0)
+            },
+            CovEvent {
+                point: inp,
+                value: Value::F64(1.2)
+            },
+        ]
+    );
 }
 
 /// The first telemetry update of an input fires COV whatever its deadband.
