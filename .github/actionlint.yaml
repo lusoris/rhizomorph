@@ -8,3 +8,12 @@
 self-hosted-runner:
   labels:
     - ubuntu-26.04
+# Exception (category D, entered 2026-11-18, expires 2027-03-18): actionlint
+# v1.7.12 does not know the concurrency `queue` key that GitHub documents since
+# 2026-05-07, which .github/workflows/pages.yml sets on its deploy job. Upstream
+# tracks it in https://github.com/rhysd/actionlint/issues/654 and /657. Delete
+# this entry once actionlint accepts pages.yml without it.
+paths:
+  .github/workflows/pages.yml:
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'

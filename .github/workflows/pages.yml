@@ -97,9 +97,12 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    # Queue every waiting deploy: without a queue, a later-arriving older run
+    # cancels the pending newer one, then skips at the head check.
     concurrency:
       group: pages
       cancel-in-progress: false
+      queue: max
     steps:
       # Prevent a late older build or a rerun of an old run from deploying.
       - name: Check that this run is the main head
