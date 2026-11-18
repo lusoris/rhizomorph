@@ -31,6 +31,7 @@ pub enum AdapterError {
 }
 
 impl fmt::Display for AdapterError {
+    /// Describes the failed operation and its cause.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Poisoned { op } => write!(f, "kernel mutex poisoned during {op}"),
@@ -40,6 +41,7 @@ impl fmt::Display for AdapterError {
 }
 
 impl std::error::Error for AdapterError {
+    /// Returns the kernel refusal of a `Kernel` error; a poisoned mutex has no source.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Poisoned { .. } => None,
@@ -56,6 +58,7 @@ pub struct SharedKernel {
 }
 
 impl Default for SharedKernel {
+    /// Builds an adapter with the default kernel capacities.
     fn default() -> Self {
         Self::new(Capacities::default())
     }
@@ -263,10 +266,12 @@ impl SharedKernel {
             .map_err(|source| AdapterError::Kernel { op: OP, source })
     }
 
+    /// Locks the kernel mutex, mapping poisoning to `AdapterError::Poisoned` for `op`.
     fn lock(&self, op: &'static str) -> Result<MutexGuard<'_, Kernel>, AdapterError> {
         self.inner.lock().map_err(|_| AdapterError::Poisoned { op })
     }
 
+    /// Milliseconds since construction, saturating at `u64::MAX`.
     fn now_millis(&self) -> Millis {
         let elapsed = self.start.elapsed().as_millis();
         let ms = u64::try_from(elapsed).unwrap_or(u64::MAX);

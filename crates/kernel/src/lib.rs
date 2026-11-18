@@ -170,6 +170,7 @@ impl Priority {
         self.0
     }
 
+    /// Zero-based array index of this level; level 1 maps to index 0.
     #[must_use]
     const fn slot_index(self) -> usize {
         (self.0 - 1) as usize
@@ -181,6 +182,7 @@ impl Priority {
 pub struct PriorityArray([Option<(LeaseId, Value)>; 16]);
 
 impl Default for PriorityArray {
+    /// Returns an array with all 16 slots empty.
     fn default() -> Self {
         Self::new()
     }
@@ -223,12 +225,14 @@ impl PriorityArray {
         self.resolve().map_or(relinquish_default, |(_, v)| v)
     }
 
+    /// Writes or clears the slot at `priority`.
     fn set_slot(&mut self, priority: Priority, entry: Option<(LeaseId, Value)>) {
         if let Some(slot) = self.0.get_mut(priority.slot_index()) {
             *slot = entry;
         }
     }
 
+    /// Returns whether `lease` holds at least one slot of this array.
     fn lease_holds_any(&self, lease: LeaseId) -> bool {
         for slot in &self.0 {
             if let Some((holder, _)) = *slot
@@ -240,6 +244,7 @@ impl PriorityArray {
         false
     }
 
+    /// Empties every slot that `lease` holds.
     fn clear_lease_slots(&mut self, lease: LeaseId) {
         for slot in &mut self.0 {
             if let Some((holder, _)) = *slot
@@ -272,6 +277,7 @@ pub struct Capacities {
 }
 
 impl Default for Capacities {
+    /// Returns `DEFAULT_POINTS`, `DEFAULT_LEASES` and `DEFAULT_POINTS_PER_LEASE`.
     fn default() -> Self {
         Self {
             points: DEFAULT_POINTS,
@@ -293,6 +299,7 @@ pub enum CapacityKind {
 }
 
 impl fmt::Display for CapacityKind {
+    /// Names the capacity that was exceeded.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Points => f.write_str("points"),
@@ -334,6 +341,7 @@ pub enum KernelError {
 }
 
 impl fmt::Display for KernelError {
+    /// Describes the refusal in one line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownPoint => f.write_str("unknown point id"),
@@ -394,6 +402,7 @@ struct LeaseSlot {
 }
 
 impl LeaseSlot {
+    /// Removes `point` from this lease's point index, if present.
     fn remove_point(&mut self, point: PointId) {
         if let Some(pos) = self.points.iter().position(|&p| p == point) {
             self.points.swap_remove(pos);
@@ -708,6 +717,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Appends `point` to the arena and returns its identifier, refusing past capacity.
     fn push_point(&mut self, point: Point) -> Result<PointId, KernelError> {
         if self.points.len() >= self.capacities.points {
             return Err(KernelError::CapacityExceeded(CapacityKind::Points));
@@ -718,6 +728,7 @@ impl Kernel {
         Ok(PointId(id_u32))
     }
 
+    /// Finds the lease table index of an issued, unrevoked `lease`.
     fn find_lease_slot(&self, lease: LeaseId) -> Result<usize, KernelError> {
         self.leases
             .iter()
@@ -725,6 +736,7 @@ impl Kernel {
             .ok_or(KernelError::UnknownLease)
     }
 
+    /// Finds the lease table index of `lease`, refusing it once `now` reaches its deadline.
     fn find_live_lease_slot(&self, lease: LeaseId, now: Millis) -> Result<usize, KernelError> {
         let idx = self.find_lease_slot(lease)?;
         let active = self
@@ -738,6 +750,7 @@ impl Kernel {
         Ok(idx)
     }
 
+    /// Removes `point` from the point index of `lease` while that lease is still held.
     fn drop_point_from_lease(&mut self, lease: LeaseId, point: PointId) {
         if let Ok(idx) = self.find_lease_slot(lease)
             && let Some(slot) = self.leases.get_mut(idx)
@@ -747,6 +760,7 @@ impl Kernel {
     }
 }
 
+/// Returns `now + ttl`, refusing a zero ttl and a deadline past `u64::MAX`.
 fn compute_deadline(now: Millis, ttl: Millis) -> Result<Millis, KernelError> {
     if ttl.0 == 0 {
         return Err(KernelError::InvalidTtl);
@@ -757,6 +771,8 @@ fn compute_deadline(now: Millis, ttl: Millis) -> Result<Millis, KernelError> {
         .ok_or(KernelError::InvalidTtl)
 }
 
+/// Clears every slot the lease in `slot` holds, fires COV for each changed present value and
+/// returns the number of points visited.
 fn revoke_lease_slot(
     slot: &mut LeaseSlot,
     points: &mut [Point],
@@ -783,6 +799,8 @@ fn revoke_lease_slot(
     visited
 }
 
+/// Writes `value` at `priority` for `lease`. Returns the displaced lease when it holds no other
+/// slot on the point, and the new present value when it changed.
 fn write_output_slot(
     points: &mut [Point],
     point: PointId,
@@ -821,6 +839,8 @@ fn write_output_slot(
     Ok((displaced, changed))
 }
 
+/// Clears the slot at `priority` when `lease` holds it. Returns whether the lease still holds a
+/// slot on the point, and the new present value when it changed.
 fn clear_output_slot(
     points: &mut [Point],
     point: PointId,
@@ -851,6 +871,8 @@ fn clear_output_slot(
     Ok((still_holds, changed))
 }
 
+/// Returns whether `next` should fire COV: the first update always fires, and later ones fire when
+/// they differ by at least the deadband.
 fn should_emit_telemetry(last_reported: Option<Value>, next: Value, deadband: Option<f64>) -> bool {
     let Some(prev) = last_reported else {
         return true;
@@ -870,6 +892,7 @@ fn should_emit_telemetry(last_reported: Option<Value>, next: Value, deadband: Op
     }
 }
 
+/// Returns whether an integer difference reaches `deadband`, comparing without float rounding.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

@@ -9,6 +9,7 @@ use kernel::{
     PriorityArray, Value, ValueKind,
 };
 
+/// Exit check, boundary: `Priority` 1 and 16 are accepted and arbitrate.
 #[test]
 fn priority_one_and_sixteen_accepted() {
     let p1 = Priority::new(1).unwrap();
@@ -29,6 +30,7 @@ fn priority_one_and_sixteen_accepted() {
     assert_eq!(k.present_value(out).unwrap(), Some(Value::I64(1)));
 }
 
+/// Exit check, boundary: lease ids 63, 64 and 65 are revoked independently, without collision.
 #[test]
 fn lease_ids_63_64_65_revoked_independently_without_collision() {
     let mut k = Kernel::new(Capacities {
@@ -63,6 +65,7 @@ fn lease_ids_63_64_65_revoked_independently_without_collision() {
     assert_eq!(k.present_value(out65).unwrap(), Some(Value::I64(65)));
 }
 
+/// Exit check, boundary: deadband 0.0 fires on any change and drops identical values.
 #[test]
 fn deadband_zero_fires_on_change_and_drops_identical() {
     let mut k = Kernel::new(Capacities::default());
@@ -89,6 +92,7 @@ fn deadband_zero_fires_on_change_and_drops_identical() {
     assert_eq!(events.len(), 4);
 }
 
+/// A difference exactly equal to the deadband fires, for `f64` and for `i64`.
 #[test]
 fn difference_exactly_equal_to_threshold_fires_f64_and_i64() {
     let mut k = Kernel::new(Capacities::default());
@@ -131,6 +135,7 @@ fn difference_exactly_equal_to_threshold_fires_f64_and_i64() {
     );
 }
 
+/// -0.0 after 0.0 fires nothing, because the two compare equal.
 #[test]
 fn negative_zero_after_positive_zero_fires_nothing() {
     let mut k = Kernel::new(Capacities::default());
@@ -149,6 +154,7 @@ fn negative_zero_after_positive_zero_fires_nothing() {
     assert_eq!(events.len(), 2);
 }
 
+/// The `i64::MIN` to `i64::MAX` difference compares exactly against deadbands of 0, 2^63 and 2^64.
 #[test]
 #[expect(
     clippy::cast_precision_loss,
@@ -192,6 +198,7 @@ fn i64_min_to_max_exact_deadband_comparison() {
     );
 }
 
+/// D5: points, leases and the per-lease index fill to capacity, then refuse without changing state.
 #[test]
 fn arena_lease_table_and_per_lease_index_filled_to_capacity_then_refused() {
     let caps = Capacities {
@@ -230,6 +237,7 @@ fn arena_lease_table_and_per_lease_index_filled_to_capacity_then_refused() {
     assert_eq!(k.present_value(p2).unwrap(), Some(Value::I64(0)));
 }
 
+/// D7: `u32::MAX` is the last lease id; the next issue is refused without wrapping.
 #[test]
 fn lease_id_exhaustion_at_u32_max() {
     let mut k = Kernel::new(Capacities {
@@ -249,6 +257,7 @@ fn lease_id_exhaustion_at_u32_max() {
     );
 }
 
+/// D7: the test helper `with_next_lease_id` never moves the lease counter backward.
 #[test]
 fn lease_counter_helper_never_moves_backward() {
     let mut k = Kernel::new(Capacities {
@@ -268,6 +277,7 @@ fn lease_counter_helper_never_moves_backward() {
     assert_eq!(third, LeaseId(3));
 }
 
+/// D7: an exhausted lease counter stays exhausted under the test helper.
 #[test]
 fn exhausted_lease_counter_stays_exhausted() {
     let mut k = Kernel::new(Capacities {
@@ -285,6 +295,7 @@ fn exhausted_lease_counter_stays_exhausted() {
     );
 }
 
+/// Exit check, boundary: `PriorityArray` is 384 bytes on `x86_64`.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn priority_array_size_is_384_bytes_on_x86_64() {
@@ -293,6 +304,7 @@ fn priority_array_size_is_384_bytes_on_x86_64() {
     assert_eq!(size_of::<PriorityArray>(), 384);
 }
 
+/// Exit check, boundary: revoking a lease that holds one point among many visits only that point.
 #[test]
 fn revoke_of_lease_holding_one_point_among_many_visits_only_that_point() {
     let mut k = Kernel::new(Capacities {

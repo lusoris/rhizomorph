@@ -18,6 +18,7 @@ use kernel_std::{Capacities, PointId, SharedKernel, Value, ValueKind};
 const DEFAULT_ITERATIONS: u64 = 2_000_000;
 const THREAD_COUNT: u64 = 4;
 
+/// Runs the three shapes at 1 and 4 threads and prints nanoseconds per update as a table.
 fn main() {
     let iterations = env::args()
         .nth(1)
@@ -45,6 +46,7 @@ fn main() {
     );
 }
 
+/// Shape (a): an `RwLock<Vec<Value>>` write plus one `Instant::now()` per update.
 fn bench_rwlock_with_clock(total_iterations: u64, threads: u64) -> f64 {
     let per_thread = (total_iterations / threads).max(1);
     let actual_total = per_thread.saturating_mul(threads);
@@ -69,6 +71,7 @@ fn bench_rwlock_with_clock(total_iterations: u64, threads: u64) -> f64 {
     mean_ns(start.elapsed().as_nanos(), actual_total)
 }
 
+/// Shape (b): an `RwLock<Vec<Value>>` write without a clock read.
 fn bench_rwlock_without_clock(total_iterations: u64, threads: u64) -> f64 {
     let per_thread = (total_iterations / threads).max(1);
     let actual_total = per_thread.saturating_mul(threads);
@@ -91,6 +94,7 @@ fn bench_rwlock_without_clock(total_iterations: u64, threads: u64) -> f64 {
     mean_ns(start.elapsed().as_nanos(), actual_total)
 }
 
+/// Shape (c): `SharedKernel::telemetry` under its one `Mutex`, without a clock read.
 fn bench_shared_kernel(total_iterations: u64, threads: u64) -> f64 {
     let per_thread = (total_iterations / threads).max(1);
     let actual_total = per_thread.saturating_mul(threads);
@@ -120,6 +124,7 @@ fn bench_shared_kernel(total_iterations: u64, threads: u64) -> f64 {
     mean_ns(start.elapsed().as_nanos(), actual_total)
 }
 
+/// Mean nanoseconds per operation; zero operations give 0.0.
 #[expect(
     clippy::cast_precision_loss,
     reason = "a mean in nanoseconds needs no more than f64 precision"

@@ -8,6 +8,8 @@ use kernel::{
     ValueKind,
 };
 
+/// Exit check, negative: NaN and infinities are refused at telemetry, command and relinquish
+/// default.
 #[test]
 fn nan_and_infinities_refused_at_telemetry_command_and_relinquish_default() {
     let mut k = Kernel::new(Capacities::default());
@@ -38,6 +40,7 @@ fn nan_and_infinities_refused_at_telemetry_command_and_relinquish_default() {
     }
 }
 
+/// Exit check, negative: `Priority` 0 and 17 are refused.
 #[test]
 fn priority_zero_and_seventeen_refused() {
     assert_eq!(Priority::new(0), Err(KernelError::InvalidPriority));
@@ -45,6 +48,7 @@ fn priority_zero_and_seventeen_refused() {
     assert_eq!(Priority::new(u8::MAX), Err(KernelError::InvalidPriority));
 }
 
+/// Exit check, negative: level 6 (Minimum On/Off) is refused for every external writer.
 #[test]
 fn priority_six_minimum_on_off_refused() {
     let mut k = Kernel::new(Capacities::default());
@@ -74,6 +78,7 @@ fn priority_six_minimum_on_off_refused() {
     );
 }
 
+/// Exit check, negative: a lease cannot relinquish a slot another lease holds.
 #[test]
 fn lease_cannot_clear_another_leases_slot() {
     let mut k = Kernel::new(Capacities::default());
@@ -103,6 +108,7 @@ fn lease_cannot_clear_another_leases_slot() {
     assert_eq!(k.present_value(out).unwrap(), Some(Value::I64(10)));
 }
 
+/// A command under a revoked lease is refused.
 #[test]
 fn write_under_revoked_lease_refused() {
     let mut k = Kernel::new(Capacities::default());
@@ -133,6 +139,7 @@ fn write_under_revoked_lease_refused() {
     );
 }
 
+/// A second revoke and a revoke of a never-issued id change nothing and fire nothing.
 #[test]
 fn double_revoke_and_never_issued_id_change_nothing_and_fire_nothing() {
     let mut k = Kernel::new(Capacities::default());
@@ -164,6 +171,7 @@ fn double_revoke_and_never_issued_id_change_nothing_and_fire_nothing() {
     assert_eq!(k.present_value(out).unwrap(), Some(Value::I64(77)));
 }
 
+/// Exit check, negative: a negative or non-finite deadband is refused at registration.
 #[test]
 fn negative_nan_and_infinite_deadband_refused() {
     let mut k = Kernel::new(Capacities::default());
@@ -179,6 +187,7 @@ fn negative_nan_and_infinite_deadband_refused() {
     }
 }
 
+/// A deadband on a boolean input is refused at registration.
 #[test]
 fn deadband_on_bool_refused() {
     let mut k = Kernel::new(Capacities::default());
@@ -192,6 +201,7 @@ fn deadband_on_bool_refused() {
     );
 }
 
+/// Exit check, negative: an `i64` and an `f64` of equal magnitude are not equal.
 #[test]
 fn different_value_kinds_never_equal_i64_not_equal_f64() {
     assert_ne!(Value::I64(1), Value::F64(1.0));
@@ -200,6 +210,7 @@ fn different_value_kinds_never_equal_i64_not_equal_f64() {
     assert_ne!(Value::Bool(true), Value::I64(1));
 }
 
+/// Registration past the points capacity is refused.
 #[test]
 fn registration_past_points_capacity_refused() {
     let mut k = Kernel::new(Capacities {
@@ -220,6 +231,7 @@ fn registration_past_points_capacity_refused() {
     );
 }
 
+/// Issuing a lease past the leases capacity is refused.
 #[test]
 fn lease_past_leases_capacity_refused() {
     let mut k = Kernel::new(Capacities {
@@ -236,6 +248,8 @@ fn lease_past_leases_capacity_refused() {
     );
 }
 
+/// A command to an input, telemetry for an output, a wrong value kind and an unknown point are each
+/// refused.
 #[test]
 fn command_to_input_telemetry_for_output_wrong_kind_and_unknown_point_refused() {
     let mut k = Kernel::new(Capacities::default());
@@ -271,6 +285,7 @@ fn command_to_input_telemetry_for_output_wrong_kind_and_unknown_point_refused() 
     );
 }
 
+/// D4: a zero ttl and a deadline past `u64::MAX` are refused.
 #[test]
 fn ttl_zero_and_deadline_overflow_refused() {
     let mut k = Kernel::new(Capacities::default());
@@ -284,6 +299,7 @@ fn ttl_zero_and_deadline_overflow_refused() {
     );
 }
 
+/// D4: renewing an expired or an unknown lease is refused.
 #[test]
 fn renew_of_expired_or_unknown_lease_refused() {
     let mut k = Kernel::new(Capacities::default());

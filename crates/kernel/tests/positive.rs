@@ -7,6 +7,7 @@ use kernel::{
     Capacities, CovEvent, Kernel, KernelError, LeaseId, Millis, PointId, Priority, Value, ValueKind,
 };
 
+/// Exit check, positive: the lowest level number holding a value wins.
 #[test]
 fn lowest_priority_level_wins() {
     let mut k = Kernel::new(Capacities::default());
@@ -51,6 +52,7 @@ fn lowest_priority_level_wins() {
     );
 }
 
+/// Exit check, positive: relinquishing the winning slot falls back to the next held slot.
 #[test]
 fn relinquish_winning_slot_falls_back_to_next_slot() {
     let mut k = Kernel::new(Capacities::default());
@@ -96,6 +98,7 @@ fn relinquish_winning_slot_falls_back_to_next_slot() {
     );
 }
 
+/// Exit check, positive: an update inside the deadband fires no COV event; one at or past it fires.
 #[test]
 fn deadband_below_threshold_fires_nothing_at_and_above_fires() {
     let mut k = Kernel::new(Capacities::default());
@@ -120,6 +123,7 @@ fn deadband_below_threshold_fires_nothing_at_and_above_fires() {
     assert_eq!(k.present_value(inp).unwrap(), Some(Value::F64(19.0)));
 }
 
+/// The first telemetry update of an input fires COV whatever its deadband.
 #[test]
 fn first_update_always_fires() {
     let mut k = Kernel::new(Capacities::default());
@@ -140,6 +144,8 @@ fn first_update_always_fires() {
     assert_eq!(events.len(), 4);
 }
 
+/// Exit check, positive: revoke clears every slot of the lease and fires COV for each changed
+/// value.
 #[test]
 fn revoke_clears_all_slots_of_lease_and_fires_cov_per_changed_value() {
     let mut k = Kernel::new(Capacities::default());
@@ -174,6 +180,7 @@ fn revoke_clears_all_slots_of_lease_and_fires_cov_per_changed_value() {
     );
 }
 
+/// Exit check, positive: the last relinquish sets the relinquish default and fires COV.
 #[test]
 fn last_relinquish_sets_relinquish_default_and_fires_cov() {
     let mut k = Kernel::new(Capacities::default());
@@ -206,6 +213,7 @@ fn last_relinquish_sets_relinquish_default_and_fires_cov() {
     );
 }
 
+/// A write below the winning level fires nothing and leaves the present value unchanged.
 #[test]
 fn write_to_non_winning_slot_fires_nothing_and_leaves_present_value() {
     let mut k = Kernel::new(Capacities::default());
@@ -237,6 +245,7 @@ fn write_to_non_winning_slot_fires_nothing_and_leaves_present_value() {
     assert_eq!(k.present_value(out).unwrap(), Some(Value::U16(50)));
 }
 
+/// Runs one fixed lease sequence with every passed time shifted by `offset`.
 fn run_timed_sequence(offset: u64) -> Result<(Vec<CovEvent>, Option<Value>), KernelError> {
     let mut k = Kernel::new(Capacities::default());
     let mut events = Vec::new();
@@ -265,6 +274,7 @@ fn run_timed_sequence(offset: u64) -> Result<(Vec<CovEvent>, Option<Value>), Ker
     Ok((events, k.present_value(out)?))
 }
 
+/// D2: shifting every passed time by one offset gives the same results, so the core reads no clock.
 #[test]
 fn core_takes_time_only_as_passed_value_offset_invariance() {
     let (events_a, val_a) = run_timed_sequence(0).unwrap();
@@ -274,6 +284,8 @@ fn core_takes_time_only_as_passed_value_offset_invariance() {
     assert_eq!(val_a, Some(Value::I64(2)));
 }
 
+/// D3: a command over another lease's slot replaces it and drops that lease's index entry when it
+/// holds no other slot on the point.
 #[test]
 fn d3_command_replaces_other_lease_slot_drops_index_when_none_left() {
     let mut k = Kernel::new(Capacities::default());
@@ -318,6 +330,7 @@ fn d3_command_replaces_other_lease_slot_drops_index_when_none_left() {
     assert_eq!(k.revoke(lease_a, &mut |_| {}).unwrap(), 0);
 }
 
+/// D3: the displaced lease keeps its index entry while it still holds another slot on the point.
 #[test]
 fn d3_command_replaces_other_lease_slot_keeps_index_when_other_slot_held() {
     let mut k = Kernel::new(Capacities::default());
@@ -369,12 +382,15 @@ fn d3_command_replaces_other_lease_slot_keeps_index_when_other_slot_held() {
     assert_eq!(k.lease_point_count(lease_a).unwrap(), 0);
 }
 
+/// Registers one output and issues one lease with ttl 100 at time 1000.
 fn setup_expiry_check(k: &mut Kernel) -> Result<(PointId, LeaseId), KernelError> {
     let out = k.register_output(Value::I64(0))?;
     let lease = k.issue_lease(Millis(100), Millis(1000))?;
     Ok((out, lease))
 }
 
+/// D4: a lease is live before its deadline and expired at it; renew extends it and expire revokes
+/// it.
 #[test]
 fn d4_lease_expiry_live_and_expired_boundaries_renew_and_expire() {
     let mut k = Kernel::new(Capacities::default());

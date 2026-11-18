@@ -11,6 +11,7 @@ use kernel_std::{
     SharedKernel, Value, ValueKind,
 };
 
+/// The adapter forwards each kernel operation and passes COV events to the caller's sink.
 #[test]
 fn adapter_forwards_operations_and_cov_events() {
     let shared = SharedKernel::new(Capacities {
@@ -63,6 +64,7 @@ fn adapter_forwards_operations_and_cov_events() {
     );
 }
 
+/// Asserts that `res` is `AdapterError::Poisoned` for `expected_op`.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the helper takes each call result by value as the call returns it"
@@ -74,6 +76,7 @@ fn assert_poisoned<T: std::fmt::Debug + PartialEq>(
     assert_eq!(res, Err(AdapterError::Poisoned { op: expected_op }));
 }
 
+/// A panicking sink poisons the mutex, and every later call returns `AdapterError::Poisoned`.
 #[test]
 fn adapter_panic_in_sink_poisons_mutex_and_next_call_returns_poisoned() {
     let shared = SharedKernel::new(Capacities::default());
@@ -114,6 +117,7 @@ fn adapter_panic_in_sink_poisons_mutex_and_next_call_returns_poisoned() {
     );
 }
 
+/// A kernel refusal comes back as `AdapterError::Kernel` with the operation name and the source.
 #[test]
 fn adapter_surfaces_kernel_error_with_op_and_source() {
     let shared = SharedKernel::new(Capacities::default());
