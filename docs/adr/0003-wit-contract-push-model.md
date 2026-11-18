@@ -71,7 +71,7 @@ different job.
 | Mechanism | Wasmtime item | Use in rhizomorph |
 | :--- | :--- | :--- |
 | Epoch interruption | `Config::epoch_interruption` (`config.rs` line 788): a global counter that the host increments | Wall-clock deadline of every guest call |
-| Memory and count caps | `StoreLimitsBuilder` (`limits.rs`), attached with `Store::limiter`: `memory_size(bytes)` (line 238), `table_elements` (line 250), `instances` (line 260), `tables` (line 270), `memories` (line 280), `trap_on_grow_failure` (line 294) | A cap of a few MiB on each linear memory, a cap on table elements, and caps on the number of instances, tables and memories in a store, so a store's total memory is bounded; the values are set in P3 |
+| Memory and count caps | `StoreLimitsBuilder` (`limits.rs`), attached with `Store::limiter`: `memory_size(bytes)` (line 238), `table_elements` (line 250), `instances` (line 260), `tables` (line 270), `memories` (line 280), `trap_on_grow_failure` (line 294) | A cap of a few MiB on each linear memory, a cap on table elements, and caps on the number of instances, tables and memories in a store, so the caps bound the linear memory and table space the instances of the store allocate; the values are set in P3 |
 | Async host functions | Host functions that await | Blocking calls such as network access, with a host-side timeout |
 | Fuel | `Config::consume_fuel` (`config.rs` line 643): instrumented code, deterministic, a store starts with no fuel | Only in replay tests that need a deterministic trap |
 
@@ -80,7 +80,12 @@ memories could otherwise use the cap several times over; the count caps
 close that gap. By default a `memory.grow` past the cap returns -1 and the
 guest keeps running. The host sets `trap_on_grow_failure(true)`, so a growth
 past the cap traps and the host revokes the lease. The Wasmtime
-documentation notes that this setting is not necessarily spec-compliant.
+documentation notes that this setting is not necessarily spec-compliant. The
+caps cover only what the instances of the guest allocate, because the
+Wasmtime documentation states that the bookkeeping of Wasmtime itself and
+allocations made by the embedder are not tracked (`limits.rs` lines 21 to
+25). Open, decided in P3: a budget for host-side allocations a guest can
+cause through host functions.
 
 Reasons, from the Wasmtime documentation at v50.0.2:
 
