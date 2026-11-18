@@ -57,6 +57,19 @@ These are goals, not shipped behaviour. Each becomes a decision record under
 The design input is by the operator; the documents in this repository are
 written from it.
 
+## Documentation
+
+- [`docs/concept.md`](docs/concept.md): what rhizomorph is, the research behind
+  it, prior art and what is still unverified.
+- [`docs/adr/`](docs/adr/README.md): decision records, from the tier model to
+  the UI stack.
+- [`docs/plan/phases.md`](docs/plan/phases.md): the phase plan, with exit
+  checks.
+- [`docs/plan/design-defects.md`](docs/plan/design-defects.md): known defects
+  of the design reference code and their fixes.
+- [`docs/fungal-mapping.md`](docs/fungal-mapping.md): how the name maps to
+  components, as analogy.
+
 ## Repository layout
 
 | Path | Purpose |
