@@ -1,7 +1,10 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Family preset from plurano/horistes (Horistes is Greek for the boundary commissioner who fixes limits, pronounced ho-RIS-tees): default.json holds the shared defaults, so this file keeps only the entries of this repository."
+  ],
   "extends": [
-    "config:recommended"
+    "github>plurano/horistes"
   ],
   "packageRules": [
     {
