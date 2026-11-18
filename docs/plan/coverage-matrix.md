@@ -241,7 +241,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
      deployed.
    - **Mitigation / stage:** `H1` bridge via `Koenkk/zigbee2mqtt` (GPL-3.0) into
      the `P9` MQTT worker (`rumqttc`).
-   - **Source:** [`docs/concept.md`](../concept.md) lines 68–82 and
+   - **Source:** [`docs/concept.md`](../concept.md) lines 69–84 and
      <https://raw.githubusercontent.com/Koenkk/zigbee2mqtt/master/LICENSE> (read
      2026-11-18).
 
@@ -251,7 +251,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
      interface carrier board (`H1` open firmware exists).
    - **Affected cells:** Class 1 (Heating and cooling control) in `house`,
      `flat`, `office`, and `school`.
-   - **Source:** [`docs/concept.md`](../concept.md) lines 68–82;
+   - **Source:** [`docs/concept.md`](../concept.md) lines 69–84;
      <https://raw.githubusercontent.com/ihormelnyk/opentherm_library/master/LICENSE>
      and <https://raw.githubusercontent.com/emsesp/EMS-ESP32/main/LICENSE> (read
      2026-11-18).
@@ -264,7 +264,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
      commercial DALI-to-KNX (`P7`) or DALI-to-BACnet (`P6`) gateway.
    - **Affected cells:** Class 3 (Lighting) and Class 9 (Presence and occupancy)
      in `office`, `school`, `hospital`, and `workshop and industrial`.
-   - **Source:** [`docs/concept.md`](../concept.md) lines 68–82 and DALI
+   - **Source:** [`docs/concept.md`](../concept.md) lines 69–84 and DALI
      Alliance specification overview <https://www.dali-alliance.org/dali/> (read
      2026-11-18).
 
@@ -276,7 +276,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
    - **Affected cells:** Class 5 (Electricity metering) and Class 6 (Heat, water
      and gas metering) across `house`, `flat`, `office`, `school`, `hospital`,
      `farm and barn`, and `workshop and industrial`.
-   - **Source:** [`docs/concept.md`](../concept.md) lines 68–82 and
+   - **Source:** [`docs/concept.md`](../concept.md) lines 69–84 and
      <https://raw.githubusercontent.com/wmbusmeters/wmbusmeters/master/LICENSE>
      (read 2026-11-18).
 
@@ -288,7 +288,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
      (Solar, battery and EV charging) in `house`, `flat`, `office`, `school`,
      `hospital`, `farm and barn`, `workshop and industrial`, and `vehicles and
      boats`.
-   - **Source:** [`docs/concept.md`](../concept.md) lines 68–82; Open Charge
+   - **Source:** [`docs/concept.md`](../concept.md) lines 69–84; Open Charge
      Alliance <https://openchargealliance.org/protocols/open-charge-point-protocol/>;
      EEBus <https://www.eebus.org/>;
      <https://raw.githubusercontent.com/EVerest/everest-core/main/LICENSE>;
@@ -303,7 +303,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
    - **Affected cells:** Class 8 (Access and door state) and Class 12 (Alarm and
      security) in `office`, `school`, `hospital`, `workshop and industrial`, and
      `data room`.
-   - **Source:** [`docs/concept.md`](../concept.md) lines 68–82 and
+   - **Source:** [`docs/concept.md`](../concept.md) lines 69–84 and
      <https://raw.githubusercontent.com/goToMain/libosdp/master/LICENSE> (read
      2026-11-18).
 
@@ -316,12 +316,15 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
      [ADR-0002](../adr/0002-priority-array-and-leases.md)). Any interlock that
      commands a separate commandable output point at `Automatic-Life Safety`
      priority level 2 is a separate design decision, as priority arrays belong
-     only to commandable outputs and writers for level 2 remain open in
-     [ADR-0002](../adr/0002-priority-array-and-leases.md).
+     only to commandable outputs and
+     [ADR-0002](../adr/0002-priority-array-and-leases.md) opens level 2 to a
+     guest only on a manifest request plus a host record
+     ([ADR-0003](../adr/0003-wit-contract-push-model.md#priority-cap)) and
+     leaves writers beyond guests open.
    - **Affected cells:** Class 13 (Life safety) across all building types except
      `outdoor and garden`.
    - **Source:** [`docs/adr/0002-priority-array-and-leases.md`](../adr/0002-priority-array-and-leases.md)
-     lines 26–35 and 47–68, and EU Construction Products Regulation `Regulation
+     lines 26–28, 44–45 and 51–84, and EU Construction Products Regulation `Regulation
      (EU) No 305/2011` / `EN 14604` / `EN 54` (verified via web search
      2026-11-18).
 
@@ -331,7 +334,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
      low-power `SDI-12`-to-LoRaWAN/Modbus field sensor carrier board.
    - **Affected cells:** Classes 6, 10, 11, 14, and 15 in `farm and barn` and
      `outdoor and garden`.
-   - **Source:** [`docs/concept.md`](../concept.md) lines 68–82 and LoRa
+   - **Source:** [`docs/concept.md`](../concept.md) lines 69–84 and LoRa
      Alliance <https://lora-alliance.org/about-lorawan/> (read 2026-11-18).
 
 9. **No native CAN (`ISO 11898-1`), `SAE J1939` / `ISOBUS` (`ISO 11783`), `NMEA
@@ -344,7 +347,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
      climate), Class 16 (Workshop and industrial machines), and Class 18
      (Vehicle and boat systems) in `farm and barn`, `workshop and industrial`,
      and `vehicles and boats`.
-   - **Source:** [`docs/concept.md`](../concept.md) lines 68–82;
+   - **Source:** [`docs/concept.md`](../concept.md) lines 69–84;
      <https://raw.githubusercontent.com/SignalK/specification/master/LICENSE>
      (`CC-BY-SA-2.0`); and
      <https://raw.githubusercontent.com/SignalK/signalk-server/master/LICENSE>
@@ -356,7 +359,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
       client subscriptions and method calls.
     - **Affected cells:** Class 16 (Workshop and industrial machines) in
       `workshop and industrial`, `school`, `hospital`, and `farm and barn`.
-    - **Source:** [`docs/concept.md`](../concept.md) lines 68–82 and OPC
+    - **Source:** [`docs/concept.md`](../concept.md) lines 69–84 and OPC
       Foundation <https://opcfoundation.org/about/opc-technologies/opc-ua/>
       (read 2026-11-18).
 
@@ -368,7 +371,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
     - **Affected cells:** Class 12 (Alarm and security) and Class 17 (Data room
       power and cooling) in `data room`, `office`, `school`, `hospital`, and
       `workshop and industrial`.
-    - **Source:** [`docs/concept.md`](../concept.md) lines 68–82 and
+    - **Source:** [`docs/concept.md`](../concept.md) lines 69–84 and
       <https://github.com/networkupstools/nut> (read 2026-11-18).
 
 12. **No native precise-positioning worker (`RTCM 10403.3 / 10403.4` over
@@ -394,7 +397,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
     - **Affected cells:** Class 19 (Precise positioning) across `office`,
       `hospital`, `farm and barn`, `workshop and industrial`, `outdoor and
       garden`, and `vehicles and boats`.
-    - **Source:** [`docs/concept.md`](../concept.md) lines 68–82;
+    - **Source:** [`docs/concept.md`](../concept.md) lines 69–84;
       <https://raw.githubusercontent.com/Stefal/rtkbase/master/LICENSE>
       (`AGPL-3.0`);
       <https://raw.githubusercontent.com/Stefal/rtkbase/master/README.md>
@@ -432,7 +435,7 @@ firmware or gateway (`H1`)**, or an **open carrier board / antenna design
       Modbus (`P2`), Matter (`P8`), or Shelly MQTT (`P9`) actuators.
     - **Affected cells:** Class 4 (Shading and blinds) and Class 8 (Access and
       door state) in `house`, `flat`, `office`, and `outdoor and garden`.
-    - **Source:** [`docs/concept.md`](../concept.md) lines 68–82 and Shelly
+    - **Source:** [`docs/concept.md`](../concept.md) lines 69–84 and Shelly
       local API documentation <https://shelly-api-docs.shelly.cloud/> (read
       2026-11-18).
 
