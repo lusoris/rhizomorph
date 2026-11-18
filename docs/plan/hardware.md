@@ -28,10 +28,11 @@ Regulation (`Regulation (EU) No 305/2011` and its successor `Regulation (EU)
 2024/3110`), domestic carbon monoxide alarms are governed by `EN 50291-1`, and
 medical devices require clinical conformity assessment under the Medical Devices
 Regulation (`Regulation (EU) 2017/745`; see [Sources](#sources)). Selling
-hardware through partners is a noted idea only, not a plan or a decision, and
-project names for hardware artefacts, repository placement, and the hardware
-licence remain open decisions of the project owner (direction of 2026-11-18,
-paraphrased).
+hardware through partners is a noted idea only, not a plan or a decision;
+`H2` carrier boards and `H3` cases are licensed under `CERN-OHL-W-2.0`
+([ADR-0008](../adr/0008-hardware-licence.md)) and live in the dedicated
+repository `lusoris/sporocarp` ([ADR-0009](../adr/0009-hardware-repository.md);
+decided by the owner on 2026-11-18, paraphrased).
 
 ## Stages
 
@@ -102,7 +103,9 @@ gateway that bridges the bus to a planned worker (`P2` Modbus, `P8` Matter, or
 `H1` leave a functional or mechanical gap documented in
 [`coverage-matrix.md`](coverage-matrix.md) (such as combined PoE + RS-485 + UWB
 / BLE Angle-of-Arrival ceiling anchors, multi-bus agricultural or marine
-isolators, or compact DIN-rail sensor hubs).
+isolators, or compact DIN-rail sensor hubs). `H2` board designs live in
+`lusoris/sporocarp` once that repository is created at the start of `H2`
+([ADR-0009](../adr/0009-hardware-repository.md)).
 
 - **Why pre-certified radio modules are required:** Designing a discrete radio
   front-end (custom RF trace layout, matching network, oscillator, and unshielded
@@ -124,7 +127,8 @@ isolators, or compact DIN-rail sensor hubs).
 
 `H3` provides printable or machinable mechanical enclosures (DIN-rail housings,
 IP-rated outdoor/barn enclosures, ceiling anchor mounts) for `H1` gateways and
-`H2` carrier boards:
+`H2` carrier boards, stored in `lusoris/sporocarp` once created
+([ADR-0009](../adr/0009-hardware-repository.md)):
 
 - **Current toolchain:** Code-defined parametric B-Rep CAD in Python using
   `build123d` (`v0.13.0`, checked 2026-11-18) or `CadQuery` (`v2.8.0`, checked
@@ -263,7 +267,10 @@ read 2026-11-18) by section number.
   logo to suggest endorsement (`CERN-OHL-S-2.0` s. 8.2, `CERN-OHL-W-2.0` s. 8.2,
   `CERN-OHL-P-2.0` s. 7.2).
 
-Decision open.
+**Decision ([ADR-0008](../adr/0008-hardware-licence.md)):** Decided by the
+owner on 2026-11-18 (paraphrased): `H2` carrier boards and `H3` enclosure models are licensed
+under **`CERN-OHL-W-2.0`**, while first-party firmware stays under `EUPL-1.2`
+as `External Material` (`CERN-OHL-W-2.0` ss. 1.8, 4.2) with no dual licence.
 
 ## Market rules for anything sold or placed on the EU market
 
@@ -290,11 +297,18 @@ Decision open.
    or `CERN-OHL-P-2.0` should govern `H2` carrier boards and `H3` enclosure
    models, and if `CERN-OHL-S-2.0` is chosen, should first-party microcontroller
    firmware be dual-licensed (`EUPL-1.2 OR CERN-OHL-S-2.0`) to avoid the
-   section 1.7(b)(i) physical-part friction?
+   section 1.7(b)(i) physical-part friction? **Decided (2026-11-18,
+   [ADR-0008](../adr/0008-hardware-licence.md)):** `CERN-OHL-W-2.0` governs
+   `H2` boards and `H3` cases; first-party firmware stays `EUPL-1.2` as
+   `External Material` (`CERN-OHL-W-2.0` ss. 1.8, 4.2) with no dual licence.
 2. **Repository placement and naming:** Should `H1` profiles, `H2` KiCad
    projects, and `H3` CAD models live in subdirectories of `lusoris/rhizomorph`
    or in dedicated sibling repositories, and what naming scheme should hardware
-   revisions use?
+   revisions use? **Decided (2026-11-18,
+   [ADR-0009](../adr/0009-hardware-repository.md)):** `H0` and `H1` device
+   profiles stay in `lusoris/rhizomorph`; `H2` boards and `H3` cases live in
+   `lusoris/sporocarp` once created at the start of `H2`. The naming scheme
+   for hardware revisions stays open.
 3. **KiCad circuit-as-code front-end:** Should `H2` schematics be authored
    directly in `KiCad 10.0.8` `.kicad_sch` files manipulated via `kicad-python`
    `0.8.0` / `kicad-skip` `0.2.5`, or compiled from `SKiDL` `3.0.0` or `atopile`
