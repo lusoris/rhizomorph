@@ -252,6 +252,28 @@ fn cross_adapter_sinks_on_two_threads_get_contended() {
     assert_eq!(b.present_value(pb), Ok(Some(Value::I64(1))));
 }
 
+/// Returns the Linux caller's thread ID for its `/proc` state entry.
+#[cfg(target_os = "linux")]
+fn caller_tid() -> String {
+    std::fs::read_link("/proc/thread-self")
+        .unwrap_or_else(|error| panic!("cannot read caller thread ID: {error}"))
+        .file_name()
+        .unwrap_or_else(|| panic!("caller thread ID has no file name"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Returns an unused thread ID where thread state cannot be read portably.
+#[cfg(not(target_os = "linux"))]
+fn caller_tid() -> String {
+    String::new()
+}
+
+/// Checks that the caller sleeps while the adapter lock is held.
+///
+/// Between sending its ID and its result, the caller has no blocking wait except
+/// the adapter mutex, so state S with no result proves it waits for the lock.
+/// An early return is caught here or by the final `Ok(Some)` assertion.
 #[cfg(target_os = "linux")]
 fn assert_caller_waits(tid: &str, value_rx: &mpsc::Receiver<Result<Option<Value>, AdapterError>>) {
     for _ in 0..1000 {
@@ -274,7 +296,17 @@ fn assert_caller_waits(tid: &str, value_rx: &mpsc::Receiver<Result<Option<Value>
     panic!("caller did not sleep while waiting for the adapter lock");
 }
 
+/// Uses a bounded window because there is no portable thread-state read.
+#[cfg(not(target_os = "linux"))]
+fn assert_caller_waits(_tid: &str, value_rx: &mpsc::Receiver<Result<Option<Value>, AdapterError>>) {
+    assert!(matches!(
+        value_rx.recv_timeout(Duration::from_millis(500)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+}
+
 /// A top-level caller waits for another thread to release the adapter.
+///
 /// On Linux, observe the caller sleeping; elsewhere, check a bounded time window.
 #[test]
 fn top_level_call_waits_for_holder_instead_of_contended() {
@@ -295,29 +327,11 @@ fn top_level_call_waits_for_holder_instead_of_contended() {
     let (value_tx, value_rx) = mpsc::channel();
     let (started_tx, started_rx) = mpsc::channel();
     thread::spawn(move || {
-        #[cfg(target_os = "linux")]
-        let started = std::fs::read_link("/proc/thread-self")
-            .unwrap()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        #[cfg(not(target_os = "linux"))]
-        let started = ();
-        started_tx.send(started).unwrap();
+        started_tx.send(caller_tid()).unwrap();
         value_tx.send(adapter.present_value(point)).unwrap();
     });
     let started = started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    #[cfg(target_os = "linux")]
     assert_caller_waits(&started, &value_rx);
-    // Other platforms have no portable thread-state read.
-    #[cfg(not(target_os = "linux"))]
-    let () = started;
-    #[cfg(not(target_os = "linux"))]
-    assert!(matches!(
-        value_rx.recv_timeout(Duration::from_millis(500)),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    ));
     release_tx.send(()).unwrap();
     assert_eq!(
         result_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
