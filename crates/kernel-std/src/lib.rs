@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Instant;
 
 pub use kernel::{
@@ -35,12 +35,25 @@ pub enum AdapterError {
         /// Underlying kernel refusal reason.
         source: KernelError,
     },
+    /// A sink's nested call found another adapter held by another thread.
+    ///
+    /// The call is refused instead of waiting, so two threads whose sinks call
+    /// each other's adapters cannot deadlock; the caller may retry after its
+    /// outer call returns.
+    Contended {
+        /// Name of the operation that encountered contention.
+        op: &'static str,
+    },
 }
 
 impl fmt::Display for AdapterError {
     /// Describes the failed operation and its cause.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Contended { op } => write!(
+                f,
+                "kernel operation {op} contended: adapter held by another thread while this thread holds another adapter"
+            ),
             Self::Reentrant { op } => write!(f, "reentrant kernel operation {op}"),
             Self::Poisoned { op } => write!(f, "kernel mutex poisoned during {op}"),
             Self::Kernel { op, source } => write!(f, "kernel operation {op} failed: {source}"),
@@ -52,7 +65,7 @@ impl std::error::Error for AdapterError {
     /// Returns the kernel refusal of a `Kernel` error; a poisoned mutex has no source.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Poisoned { .. } | Self::Reentrant { .. } => None,
+            Self::Contended { .. } | Self::Poisoned { .. } | Self::Reentrant { .. } => None,
             Self::Kernel { source, .. } => Some(source),
         }
     }
@@ -62,6 +75,7 @@ impl std::error::Error for AdapterError {
 /// Time is the supplied origin plus elapsed milliseconds, saturating at `u64::MAX`.
 /// A sink may call a different adapter, but same-thread re-entry into any adapter
 /// already held by that thread returns [`AdapterError::Reentrant`].
+/// A nested call to an adapter held by another thread returns [`AdapterError::Contended`].
 #[derive(Debug)]
 pub struct SharedKernel {
     inner: Mutex<Kernel>,
@@ -100,6 +114,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned, or
     /// [`AdapterError::Kernel`] if the kernel refuses registration.
     pub fn register_input(
@@ -119,6 +134,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned, or
     /// [`AdapterError::Kernel`] if the kernel refuses registration.
     pub fn register_output(&self, relinquish_default: Value) -> Result<PointId, AdapterError> {
@@ -134,6 +150,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned, or
     /// [`AdapterError::Kernel`] if the kernel refuses the update.
     pub fn telemetry(
@@ -154,6 +171,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned, or
     /// [`AdapterError::Kernel`] if the kernel refuses lease issuance.
     pub fn issue_lease(&self, ttl: Millis) -> Result<LeaseId, AdapterError> {
@@ -170,6 +188,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned, or
     /// [`AdapterError::Kernel`] if the lease is unknown, expired, or overflows.
     pub fn renew(&self, lease: LeaseId) -> Result<(), AdapterError> {
@@ -186,6 +205,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned, or
     /// [`AdapterError::Kernel`] if the lease is unknown or already revoked.
     pub fn revoke(
@@ -207,6 +227,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned.
     pub fn expire(&self, sink: &mut impl FnMut(CovEvent)) -> Result<usize, AdapterError> {
         const OP: &str = "expire";
@@ -220,6 +241,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned, or
     /// [`AdapterError::Kernel`] if the kernel refuses the command.
     pub fn command(
@@ -243,6 +265,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned, or
     /// [`AdapterError::Kernel`] if the kernel refuses the relinquish.
     pub fn relinquish(
@@ -265,6 +288,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned, or
     /// [`AdapterError::Kernel`] if `point` is unknown.
     pub fn present_value(&self, point: PointId) -> Result<Option<Value>, AdapterError> {
@@ -280,6 +304,7 @@ impl SharedKernel {
     /// # Errors
     ///
     /// Returns [`AdapterError::Reentrant`] on same-thread re-entry,
+    /// [`AdapterError::Contended`] for a nested call to an adapter held by another thread,
     /// [`AdapterError::Poisoned`] if the lock is poisoned, or
     /// [`AdapterError::Kernel`] if `lease` is unknown.
     pub fn lease_point_count(&self, lease: LeaseId) -> Result<usize, AdapterError> {
@@ -290,16 +315,27 @@ impl SharedKernel {
             .map_err(|source| AdapterError::Kernel { op: OP, source })
     }
 
-    /// Locks the kernel mutex, mapping poisoning to `AdapterError::Poisoned` for `op`.
+    /// Locks the kernel mutex for `op`.
+    ///
+    /// A thread that holds no adapter waits for the mutex. A thread that already
+    /// holds another adapter tries once and gets `AdapterError::Contended` if the
+    /// mutex is held, so no thread waits on a mutex while holding one and no
+    /// wait-for cycle can form. Poisoning maps to `AdapterError::Poisoned`.
     fn lock(&self, op: &'static str) -> Result<ActiveGuard<'_>, AdapterError> {
         let address = std::ptr::from_ref(self) as usize;
         if HELD.with(|held| held.borrow().contains(&address)) {
             return Err(AdapterError::Reentrant { op });
         }
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| AdapterError::Poisoned { op })?;
+        let guard = if HELD.with(|held| held.borrow().is_empty()) {
+            self.inner
+                .lock()
+                .map_err(|_| AdapterError::Poisoned { op })?
+        } else {
+            self.inner.try_lock().map_err(|error| match error {
+                TryLockError::WouldBlock => AdapterError::Contended { op },
+                TryLockError::Poisoned(_) => AdapterError::Poisoned { op },
+            })?
+        };
         HELD.with(|held| held.borrow_mut().push(address));
         Ok(ActiveGuard { guard })
     }

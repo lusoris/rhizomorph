@@ -5,6 +5,9 @@
 
 use std::error::Error;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Barrier, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use kernel_std::{
     AdapterError, Capacities, CovEvent, Kernel, KernelError, LeaseId, Millis, PointId, Priority,
@@ -185,6 +188,118 @@ fn callbacks_reject_reentry_but_allow_other_adapter_and_restore_guard() {
                     );
                 })
                 .unwrap();
+        })
+        .unwrap();
+    assert_eq!(first.present_value(a), Ok(Some(Value::I64(1))));
+}
+
+/// Cross-adapter callbacks fail promptly while both outer calls hold their locks.
+#[test]
+fn cross_adapter_sinks_on_two_threads_get_contended() {
+    let a = Arc::new(SharedKernel::default());
+    let b = Arc::new(SharedKernel::default());
+    let pa = a.register_input(ValueKind::I64, None).unwrap();
+    let pb = b.register_input(ValueKind::I64, None).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let (nested_tx, nested_rx) = mpsc::channel();
+    let (outer_tx, outer_rx) = mpsc::channel();
+    let (release_a, wait_a) = mpsc::channel();
+    let (release_b, wait_b) = mpsc::channel();
+    for (outer, inner, point, other_point, release) in [
+        (Arc::clone(&a), Arc::clone(&b), pa, pb, wait_a),
+        (Arc::clone(&b), Arc::clone(&a), pb, pa, wait_b),
+    ] {
+        let barrier = Arc::clone(&barrier);
+        let nested_tx = nested_tx.clone();
+        let outer_tx = outer_tx.clone();
+        thread::spawn(move || {
+            let result = outer.telemetry(point, Value::I64(1), &mut |_| {
+                barrier.wait();
+                nested_tx.send(inner.present_value(other_point)).unwrap();
+                release.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            outer_tx.send(result).unwrap();
+        });
+    }
+    for _ in 0..2 {
+        let result = nested_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deadlock");
+        assert_eq!(
+            result,
+            Err(AdapterError::Contended {
+                op: "present_value"
+            })
+        );
+    }
+    release_a.send(()).unwrap();
+    release_b.send(()).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            outer_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(())
+        );
+    }
+    assert_eq!(a.present_value(pa), Ok(Some(Value::I64(1))));
+    assert_eq!(b.present_value(pb), Ok(Some(Value::I64(1))));
+}
+
+/// A top-level caller waits for another thread to release the adapter.
+#[test]
+fn top_level_call_waits_for_holder_instead_of_contended() {
+    let adapter = Arc::new(SharedKernel::default());
+    let point = adapter.register_input(ValueKind::I64, None).unwrap();
+    let (holding_tx, holding_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let holder = Arc::clone(&adapter);
+    thread::spawn(move || {
+        let result = holder.telemetry(point, Value::I64(1), &mut |_| {
+            holding_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        result_tx.send(result).unwrap();
+    });
+    holding_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (value_tx, value_rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel();
+    thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        value_tx.send(adapter.present_value(point)).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert!(matches!(
+        value_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        result_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        value_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        Ok(Some(Value::I64(1)))
+    );
+}
+
+/// A nested call into a different, poisoned adapter returns `Poisoned`, not `Contended`.
+#[test]
+fn nested_call_into_poisoned_other_adapter_returns_poisoned() {
+    let first = SharedKernel::new(Capacities::default());
+    let second = SharedKernel::new(Capacities::default());
+    let a = first.register_input(ValueKind::I64, None).unwrap();
+    let b = second.register_input(ValueKind::I64, None).unwrap();
+    let caught = catch_unwind(AssertUnwindSafe(|| {
+        let _ = second.telemetry(b, Value::I64(1), &mut |_| {
+            panic!("sink panic under lock");
+        });
+    }));
+    assert!(caught.is_err());
+    first
+        .telemetry(a, Value::I64(1), &mut |_| {
+            assert_poisoned(second.present_value(b), "present_value");
         })
         .unwrap();
     assert_eq!(first.present_value(a), Ok(Some(Value::I64(1))));

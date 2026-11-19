@@ -91,7 +91,9 @@ requires a lease in P1.
   `command`, `relinquish`, `revoke`, `expire`) accept a caller sink
   `&mut impl FnMut(CovEvent)` where `CovEvent { point: PointId, value: Value }`.
 - `SharedKernel` passes the caller's sink through under the mutex guard; re-entry
-  into a held adapter returns `Reentrant` (`crates/kernel-std/tests/adapter.rs`).
+  into a held adapter returns `Reentrant`; a nested call into a different adapter
+  held by another thread returns `Contended` instead of waiting
+  (`crates/kernel-std/tests/adapter.rs`).
 - Revocation completes state changes before calling the sink
   (`crates/kernel/tests/negative.rs`).
 - The asynchronous broadcast channel and its slow-consumer loss policy
