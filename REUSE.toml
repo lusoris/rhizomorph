@@ -11,6 +11,7 @@ version = 1
 [[annotations]]
 path = [
     "README.md",
+    "docs/requirements.txt",
     ".gitignore",
     "renovate.json",
     "Cargo.lock",
@@ -29,6 +30,7 @@ path = [
     ".claude/**",
     ".codex/**",
     ".config/**",
+    ".continue/**",
     ".cursor/**",
     ".devcontainer/**",
     ".fleet/**",
@@ -47,6 +49,7 @@ path = [
     ".dir-locals.el",
     ".editorconfig",
     ".gitattributes",
+    ".mcp.json",
     ".nvim.lua",
     ".standards-baseline.json",
     ".standards.lock",
@@ -59,6 +62,7 @@ path = [
     "Makefile",
     "SECURITY.md",
     "lefthook.yml",
+    "opencode.json",
     "standards.sublime-project",
 ]
 precedence = "closest"

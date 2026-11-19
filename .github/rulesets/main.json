@@ -51,6 +51,9 @@
       "parameters": {
         "required_status_checks": [
           {
+            "context": "Docs build"
+          },
+          {
             "context": "REUSE lint"
           },
           {
