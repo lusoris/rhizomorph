@@ -20,14 +20,18 @@ name: Code scanning
 permissions: {}
 
 concurrency:
-  # Each push and scheduled run gets its own group and is never cancelled,
-  # so every main commit gets its verdict.
-  group: ${{ github.workflow }}-${{ github.run_id }}
+  # One run scans at a time and at most one waits. A newer push or
+  # scheduled run replaces the waiting one, so a burst of pushes scans the
+  # first and the newest commit; code scanning keeps the newest analysis.
+  group: ${{ github.workflow }}
   cancel-in-progress: false
 
 jobs:
   analyze:
     name: CodeQL (${{ matrix.language }})
+    # Only the main branch's own workflow uploads findings: a manual run
+    # started from another branch is skipped.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
@@ -35,6 +39,7 @@ jobs:
       security-events: write  # the findings go to the forge's code scanning
     strategy:
       fail-fast: false
+      max-parallel: 2  # at most two analyses at once
       matrix:
         # CodeQL reads Python and workflows without a build. A language with
         # no source files fails the analysis, so Rust joins with the crates.
