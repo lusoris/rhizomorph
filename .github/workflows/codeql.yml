@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 #
-# Code scanning: CodeQL analyses the Python and workflow code of this
-# repository and uploads findings to the forge's code scanning. The job is no
-# part of the verification gate and no required check; it runs on main, once
-# a week, and by hand. It does not run on pull requests: uploading findings
-# needs security-events: write, which no job a pull request starts may hold.
+# Code scanning: CodeQL analyses the Python, workflow and Rust code of
+# this repository and uploads findings to the forge's code scanning. The
+# job is no part of the verification gate and no required check; it runs
+# on main, once a week, and by hand. It does not run on pull requests:
+# uploading findings needs security-events: write, which no job a pull
+# request starts may hold.
 # Copied from the Praetor engine's codeql.yml with its Go steps removed.
 name: Code scanning
 
@@ -41,12 +42,15 @@ jobs:
       fail-fast: false
       max-parallel: 2  # at most two analyses at once
       matrix:
-        # CodeQL reads Python and workflows without a build. A language with
-        # no source files fails the analysis, so Rust joins with the crates.
+        # CodeQL reads all three without a build. For Rust it runs
+        # rust-analyzer on the Cargo workspace, and the runner's rustup
+        # installs the toolchain rust-toolchain.toml pins.
         include:
           - language: actions
             build-mode: none
           - language: python
+            build-mode: none
+          - language: rust
             build-mode: none
     steps:
       - name: Checkout Source Code
