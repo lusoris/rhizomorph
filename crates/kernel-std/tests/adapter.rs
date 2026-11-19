@@ -5,7 +5,7 @@
 
 use std::error::Error;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -200,27 +200,35 @@ fn cross_adapter_sinks_on_two_threads_get_contended() {
     let b = Arc::new(SharedKernel::default());
     let pa = a.register_input(ValueKind::I64, None).unwrap();
     let pb = b.register_input(ValueKind::I64, None).unwrap();
-    let barrier = Arc::new(Barrier::new(2));
+    let (ready_tx, ready_rx) = mpsc::channel();
     let (nested_tx, nested_rx) = mpsc::channel();
     let (outer_tx, outer_rx) = mpsc::channel();
+    let (go_a, start_a) = mpsc::channel();
+    let (go_b, start_b) = mpsc::channel();
     let (release_a, wait_a) = mpsc::channel();
     let (release_b, wait_b) = mpsc::channel();
-    for (outer, inner, point, other_point, release) in [
-        (Arc::clone(&a), Arc::clone(&b), pa, pb, wait_a),
-        (Arc::clone(&b), Arc::clone(&a), pb, pa, wait_b),
+    for (outer, inner, point, other_point, start, release) in [
+        (Arc::clone(&a), Arc::clone(&b), pa, pb, start_a, wait_a),
+        (Arc::clone(&b), Arc::clone(&a), pb, pa, start_b, wait_b),
     ] {
-        let barrier = Arc::clone(&barrier);
+        let ready_tx = ready_tx.clone();
         let nested_tx = nested_tx.clone();
         let outer_tx = outer_tx.clone();
         thread::spawn(move || {
             let result = outer.telemetry(point, Value::I64(1), &mut |_| {
-                barrier.wait();
+                ready_tx.send(()).unwrap();
+                start.recv_timeout(Duration::from_secs(10)).unwrap();
                 nested_tx.send(inner.present_value(other_point)).unwrap();
                 release.recv_timeout(Duration::from_secs(10)).unwrap();
             });
             outer_tx.send(result).unwrap();
         });
     }
+    for _ in 0..2 {
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+    go_a.send(()).unwrap();
+    go_b.send(()).unwrap();
     for _ in 0..2 {
         let result = nested_rx
             .recv_timeout(Duration::from_secs(10))
@@ -245,6 +253,11 @@ fn cross_adapter_sinks_on_two_threads_get_contended() {
 }
 
 /// A top-level caller waits for another thread to release the adapter.
+///
+/// The caller must not return within a 500 ms window while the holder keeps the
+/// adapter; an implementation that refused top-level calls would return
+/// `Contended` inside that window unless the caller thread stays descheduled
+/// for all of it.
 #[test]
 fn top_level_call_waits_for_holder_instead_of_contended() {
     let adapter = Arc::new(SharedKernel::default());
@@ -268,10 +281,9 @@ fn top_level_call_waits_for_holder_instead_of_contended() {
         value_tx.send(adapter.present_value(point)).unwrap();
     });
     started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    thread::sleep(Duration::from_millis(50));
     assert!(matches!(
-        value_rx.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
+        value_rx.recv_timeout(Duration::from_millis(500)),
+        Err(mpsc::RecvTimeoutError::Timeout)
     ));
     release_tx.send(()).unwrap();
     assert_eq!(
