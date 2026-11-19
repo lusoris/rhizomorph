@@ -252,12 +252,30 @@ fn cross_adapter_sinks_on_two_threads_get_contended() {
     assert_eq!(b.present_value(pb), Ok(Some(Value::I64(1))));
 }
 
+#[cfg(target_os = "linux")]
+fn assert_caller_waits(tid: &str, value_rx: &mpsc::Receiver<Result<Option<Value>, AdapterError>>) {
+    for _ in 0..1000 {
+        match value_rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            result => panic!("caller returned or disconnected while lock held: {result:?}"),
+        }
+        let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+            .unwrap_or_else(|error| panic!("cannot read caller thread state: {error}"));
+        let fields = stat
+            .rsplit_once(')')
+            .unwrap_or_else(|| panic!("invalid caller thread stat: {stat}"))
+            .1;
+        let state = fields.split_whitespace().next();
+        if state == Some("S") {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("caller did not sleep while waiting for the adapter lock");
+}
+
 /// A top-level caller waits for another thread to release the adapter.
-///
-/// The caller must not return within a 500 ms window while the holder keeps the
-/// adapter; an implementation that refused top-level calls would return
-/// `Contended` inside that window unless the caller thread stays descheduled
-/// for all of it.
+/// On Linux, observe the caller sleeping; elsewhere, check a bounded time window.
 #[test]
 fn top_level_call_waits_for_holder_instead_of_contended() {
     let adapter = Arc::new(SharedKernel::default());
@@ -277,10 +295,25 @@ fn top_level_call_waits_for_holder_instead_of_contended() {
     let (value_tx, value_rx) = mpsc::channel();
     let (started_tx, started_rx) = mpsc::channel();
     thread::spawn(move || {
-        started_tx.send(()).unwrap();
+        #[cfg(target_os = "linux")]
+        let started = std::fs::read_link("/proc/thread-self")
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(not(target_os = "linux"))]
+        let started = ();
+        started_tx.send(started).unwrap();
         value_tx.send(adapter.present_value(point)).unwrap();
     });
-    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let started = started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    #[cfg(target_os = "linux")]
+    assert_caller_waits(&started, &value_rx);
+    // Other platforms have no portable thread-state read.
+    #[cfg(not(target_os = "linux"))]
+    let () = started;
+    #[cfg(not(target_os = "linux"))]
     assert!(matches!(
         value_rx.recv_timeout(Duration::from_millis(500)),
         Err(mpsc::RecvTimeoutError::Timeout)
