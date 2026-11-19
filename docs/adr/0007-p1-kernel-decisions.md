@@ -30,7 +30,8 @@ requires a lease in P1.
 - `telemetry` takes no time value.
 - `SharedKernel` (`crates/kernel-std/src/lib.rs`) computes `Millis` as elapsed
   milliseconds since its construction `std::time::Instant`, saturating at
-  `u64::MAX`.
+  `u64::MAX`. Wrapping an existing kernel requires its clock origin
+  (`crates/kernel-std/tests/adapter.rs`).
 - **Reason**: Keeping clock reads out of the core preserves deterministic
   `no_std` testing (`crates/kernel/tests/positive.rs`) and removes a system
   clock read from the hot telemetry ingress path
@@ -64,8 +65,10 @@ requires a lease in P1.
 - `renew(lease, now)` on a live lease advances its deadline to `now + ttl`.
 - `expire(now, sink)` revokes every expired lease within the bounded lease
   table using the same slot-clearing and COV resolution path as `revoke`.
-- **Reason**: A writer that stalls without crashing or closing its transport
-  still releases its priority overrides within a bounded deadline (HISS-02).
+- The host calls `expire` at a bounded interval; release is bounded by ttl plus
+  the host sweep interval (`crates/kernel/tests/positive.rs`).
+- **Reason**: This bounds how long a stalled writer retains its priority overrides
+  (HISS-02).
 - **Revisit when**: A writer class cannot renew within its ttl, or renew cost
   shows in the P1 measurement.
 
@@ -86,7 +89,10 @@ requires a lease in P1.
 - Core and adapter mutations that can change a present value (`telemetry`,
   `command`, `relinquish`, `revoke`, `expire`) accept a caller sink
   `&mut impl FnMut(CovEvent)` where `CovEvent { point: PointId, value: Value }`.
-- `SharedKernel` passes the caller's sink through under the mutex guard.
+- `SharedKernel` passes the caller's sink through under the mutex guard; re-entry
+  into a held adapter returns `Reentrant` (`crates/kernel-std/tests/adapter.rs`).
+- Revocation completes state changes before calling the sink
+  (`crates/kernel/tests/negative.rs`).
 - The asynchronous broadcast channel and its slow-consumer loss policy
   ([ADR-0001](0001-tier-model.md), [ADR-0004](0004-storage-split.md)) are
   deferred to phase P4 (`docs/plan/phases.md`).
@@ -103,6 +109,8 @@ requires a lease in P1.
 - The last identifier ever issued is `u32::MAX`; every subsequent `issue_lease`
   call is refused with `KernelError::LeaseIdsExhausted` without wrapping
   (`crates/kernel/tests/boundary.rs`).
+- Issuance checks invalid ttl, identifier exhaustion, then capacity, in that
+  order (`crates/kernel/tests/boundary.rs`).
 - The hidden test helper `Kernel::with_next_lease_id` only moves the counter
   forward and leaves an exhausted counter exhausted, so it cannot make the
   kernel issue an identifier twice (`crates/kernel/tests/boundary.rs`).

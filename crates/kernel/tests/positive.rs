@@ -465,3 +465,34 @@ fn d4_lease_expiry_live_and_expired_boundaries_renew_and_expire() {
         }]
     );
 }
+
+/// Revocation emits one COV event per changed output, in point index order.
+#[test]
+fn revoke_emits_changed_points_in_index_order() {
+    let mut k = kernel::Kernel::new(kernel::Capacities {
+        points: 3,
+        leases: 1,
+        points_per_lease: 3,
+    });
+    let points: Vec<_> = (0..3)
+        .map(|_| k.register_output(kernel::Value::I64(0)).unwrap())
+        .collect();
+    let lease = k
+        .issue_lease(kernel::Millis(100), kernel::Millis(0))
+        .unwrap();
+    for &point in &points {
+        k.command(
+            lease,
+            point,
+            kernel::Priority::MANUAL_OPERATOR,
+            kernel::Value::I64(1),
+            kernel::Millis(0),
+            &mut |_| {},
+        )
+        .unwrap();
+    }
+    let mut events = Vec::new();
+    k.revoke(lease, &mut |event| events.push(event.point))
+        .unwrap();
+    assert_eq!(events, points);
+}

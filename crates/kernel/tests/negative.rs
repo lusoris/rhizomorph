@@ -312,3 +312,53 @@ fn renew_of_expired_or_unknown_lease_refused() {
         Err(KernelError::UnknownLease)
     );
 }
+
+/// A panicking sink during revocation leaves no output commanded by the revoked lease.
+#[test]
+fn revocation_finishes_state_before_panicking_sink() {
+    let mut k = kernel::Kernel::new(kernel::Capacities {
+        points: 3,
+        leases: 2,
+        points_per_lease: 3,
+    });
+    let points: Vec<_> = (0..3)
+        .map(|_| k.register_output(kernel::Value::I64(0)).unwrap())
+        .collect();
+    let lease = k
+        .issue_lease(kernel::Millis(100), kernel::Millis(0))
+        .unwrap();
+    for &point in &points {
+        k.command(
+            lease,
+            point,
+            kernel::Priority::MANUAL_OPERATOR,
+            kernel::Value::I64(1),
+            kernel::Millis(0),
+            &mut |_| {},
+        )
+        .unwrap();
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        k.revoke(lease, &mut |_| panic!("sink")).unwrap();
+    }));
+    assert!(result.is_err());
+    assert_eq!(
+        k.lease_point_count(lease),
+        Err(kernel::KernelError::UnknownLease)
+    );
+    let next = k
+        .issue_lease(kernel::Millis(100), kernel::Millis(0))
+        .unwrap();
+    for point in points {
+        assert_eq!(k.present_value(point), Ok(Some(kernel::Value::I64(0))));
+        k.command(
+            next,
+            point,
+            kernel::Priority::MANUAL_OPERATOR,
+            kernel::Value::I64(2),
+            kernel::Millis(0),
+            &mut |_| {},
+        )
+        .unwrap();
+    }
+}

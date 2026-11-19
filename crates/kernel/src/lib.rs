@@ -377,6 +377,7 @@ struct OutputPoint {
     relinquish_default: Value,
     priority_array: PriorityArray,
     present_value: Value,
+    cov_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -528,6 +529,7 @@ impl Kernel {
             relinquish_default,
             priority_array: PriorityArray::new(),
             present_value: relinquish_default,
+            cov_pending: false,
         }))
     }
 
@@ -571,16 +573,16 @@ impl Kernel {
     /// # Errors
     ///
     /// Returns [`KernelError::InvalidTtl`] if `ttl` is zero or `now + ttl` overflows,
-    /// [`KernelError::CapacityExceeded`] if the lease table is full, or
-    /// [`KernelError::LeaseIdsExhausted`] if `u32::MAX` was already issued.
+    /// [`KernelError::LeaseIdsExhausted`] if `u32::MAX` was already issued, or
+    /// [`KernelError::CapacityExceeded`] if the lease table is full.
     pub fn issue_lease(&mut self, ttl: Millis, now: Millis) -> Result<LeaseId, KernelError> {
         let deadline = compute_deadline(now, ttl)?;
+        let raw_id = self.next_lease_id.ok_or(KernelError::LeaseIdsExhausted)?;
         let free_idx = self
             .leases
             .iter()
             .position(|s| s.state.is_none())
             .ok_or(KernelError::CapacityExceeded(CapacityKind::Leases))?;
-        let raw_id = self.next_lease_id.ok_or(KernelError::LeaseIdsExhausted)?;
         self.next_lease_id = raw_id.checked_add(1);
         let id = LeaseId(raw_id);
         if let Some(slot) = self.leases.get_mut(free_idx) {
@@ -627,7 +629,8 @@ impl Kernel {
     }
 
     /// Revokes every lease whose deadline has been reached (`now >= deadline`),
-    /// returning the number of expired leases revoked.
+    /// returning the number of expired leases revoked. The host must call `expire`
+    /// at a bounded interval; release is bounded by ttl plus that sweep interval.
     pub fn expire(&mut self, now: Millis, sink: &mut impl FnMut(CovEvent)) -> usize {
         let mut expired_count: usize = 0;
         for slot in &mut self.leases {
@@ -791,13 +794,18 @@ fn revoke_lease_slot(
         if let Some(Point::Output(out)) = points.get_mut(point_id.0 as usize) {
             out.priority_array.clear_lease_slots(active.id);
             let resolved = out.priority_array.resolve_value(out.relinquish_default);
-            if resolved != out.present_value {
-                out.present_value = resolved;
-                sink(CovEvent {
-                    point: point_id,
-                    value: resolved,
-                });
-            }
+            out.cov_pending = resolved != out.present_value;
+            out.present_value = resolved;
+        }
+    }
+    for &point_id in &slot.points {
+        if let Some(Point::Output(out)) = points.get_mut(point_id.0 as usize)
+            && core::mem::take(&mut out.cov_pending)
+        {
+            sink(CovEvent {
+                point: point_id,
+                value: out.present_value,
+            });
         }
     }
     slot.points.clear();

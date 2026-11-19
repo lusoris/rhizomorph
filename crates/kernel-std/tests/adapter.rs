@@ -7,7 +7,7 @@ use std::error::Error;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use kernel_std::{
-    AdapterError, Capacities, CovEvent, KernelError, LeaseId, Millis, PointId, Priority,
+    AdapterError, Capacities, CovEvent, Kernel, KernelError, LeaseId, Millis, PointId, Priority,
     SharedKernel, Value, ValueKind,
 };
 
@@ -131,4 +131,61 @@ fn adapter_surfaces_kernel_error_with_op_and_source() {
     );
     assert!(err.source().is_some());
     assert!(err.to_string().contains("present_value"));
+}
+
+/// A wrapped kernel keeps its lease deadlines: the caller's clock origin decides whether a lease is live.
+#[test]
+fn wrapped_kernel_uses_caller_clock_origin() {
+    for (origin, expected) in [
+        (10_000, Ok(())),
+        (70_000, Err(KernelError::LeaseExpired)),
+        (u64::MAX, Err(KernelError::LeaseExpired)),
+    ] {
+        let mut kernel = Kernel::new(Capacities::default());
+        let point = kernel.register_output(Value::I64(0)).unwrap();
+        let lease = kernel.issue_lease(Millis(60_000), Millis(10_000)).unwrap();
+        let shared = SharedKernel::from_kernel(kernel, Millis(origin));
+        let result = shared.command(
+            lease,
+            point,
+            Priority::MANUAL_OPERATOR,
+            Value::I64(1),
+            &mut |_| {},
+        );
+        assert_eq!(
+            result,
+            expected.map_err(|source| AdapterError::Kernel {
+                op: "command",
+                source
+            })
+        );
+    }
+}
+
+/// A sink re-entering its own adapter gets `Reentrant`, a different adapter still works, and the guard is restored afterwards.
+#[test]
+fn callbacks_reject_reentry_but_allow_other_adapter_and_restore_guard() {
+    let first = SharedKernel::new(Capacities::default());
+    let second = SharedKernel::new(Capacities::default());
+    let a = first.register_input(ValueKind::I64, None).unwrap();
+    let b = second.register_input(ValueKind::I64, None).unwrap();
+    first
+        .telemetry(a, Value::I64(1), &mut |_| {
+            assert_eq!(
+                first.telemetry(a, Value::I64(2), &mut |_| {}),
+                Err(AdapterError::Reentrant { op: "telemetry" })
+            );
+            second
+                .telemetry(b, Value::I64(2), &mut |_| {
+                    assert_eq!(
+                        first.present_value(a),
+                        Err(AdapterError::Reentrant {
+                            op: "present_value"
+                        })
+                    );
+                })
+                .unwrap();
+        })
+        .unwrap();
+    assert_eq!(first.present_value(a), Ok(Some(Value::I64(1))));
 }

@@ -352,3 +352,64 @@ fn revoke_of_lease_holding_one_point_among_many_visits_only_that_point() {
     let visited = k.revoke(lease, &mut |_| {}).unwrap();
     assert_eq!(visited, 1);
 }
+
+/// An exhausted lease counter reports `LeaseIdsExhausted` even when the lease table is full.
+#[test]
+fn exhausted_ids_take_precedence_over_full_table() {
+    let caps = kernel::Capacities {
+        points: 1,
+        leases: 1,
+        points_per_lease: 1,
+    };
+    let mut k = kernel::Kernel::new(caps).with_next_lease_id(u32::MAX);
+    assert_eq!(
+        k.issue_lease(kernel::Millis(1), kernel::Millis(0)),
+        Ok(kernel::LeaseId(u32::MAX))
+    );
+    assert_eq!(
+        k.issue_lease(kernel::Millis(1), kernel::Millis(0)),
+        Err(kernel::KernelError::LeaseIdsExhausted)
+    );
+    k.revoke(kernel::LeaseId(u32::MAX), &mut |_| {}).unwrap();
+    assert_eq!(
+        k.issue_lease(kernel::Millis(1), kernel::Millis(0)),
+        Err(kernel::KernelError::LeaseIdsExhausted)
+    );
+    let mut full = kernel::Kernel::new(caps);
+    assert!(
+        full.issue_lease(kernel::Millis(1), kernel::Millis(0))
+            .is_ok()
+    );
+    assert_eq!(
+        full.issue_lease(kernel::Millis(1), kernel::Millis(0)),
+        Err(kernel::KernelError::CapacityExceeded(
+            kernel::CapacityKind::Leases
+        ))
+    );
+}
+
+/// Revoking a lease whose command matched the relinquish default emits no COV event.
+#[test]
+fn revoke_unchanged_value_emits_no_event() {
+    let mut k = kernel::Kernel::new(kernel::Capacities {
+        points: 1,
+        leases: 1,
+        points_per_lease: 1,
+    });
+    let point = k.register_output(kernel::Value::I64(0)).unwrap();
+    let lease = k
+        .issue_lease(kernel::Millis(100), kernel::Millis(0))
+        .unwrap();
+    k.command(
+        lease,
+        point,
+        kernel::Priority::MANUAL_OPERATOR,
+        kernel::Value::I64(0),
+        kernel::Millis(0),
+        &mut |_| {},
+    )
+    .unwrap();
+    let mut events = Vec::new();
+    k.revoke(lease, &mut |event| events.push(event)).unwrap();
+    assert_eq!(events, [] as [kernel::CovEvent; 0]);
+}
