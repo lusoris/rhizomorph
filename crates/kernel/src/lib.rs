@@ -779,6 +779,24 @@ fn compute_deadline(now: Millis, ttl: Millis) -> Result<Millis, KernelError> {
         .ok_or(KernelError::InvalidTtl)
 }
 
+/// Completes pending revocation cleanup even if an event sink unwinds.
+struct RevocationCleanup<'a> {
+    index: &'a mut Vec<PointId>,
+    points: &'a mut [Point],
+}
+
+impl Drop for RevocationCleanup<'_> {
+    /// Clears pending flags and empties the pre-allocated index.
+    fn drop(&mut self) {
+        for &point_id in self.index.iter() {
+            if let Some(Point::Output(out)) = self.points.get_mut(point_id.0 as usize) {
+                out.cov_pending = false;
+            }
+        }
+        self.index.clear();
+    }
+}
+
 /// Clears every slot the lease in `slot` holds, fires COV for each changed present value and
 /// returns the number of points visited.
 fn revoke_lease_slot(
@@ -798,8 +816,12 @@ fn revoke_lease_slot(
             out.present_value = resolved;
         }
     }
-    for &point_id in &slot.points {
-        if let Some(Point::Output(out)) = points.get_mut(point_id.0 as usize)
+    let cleanup = RevocationCleanup {
+        index: &mut slot.points,
+        points,
+    };
+    for &point_id in cleanup.index.iter() {
+        if let Some(Point::Output(out)) = cleanup.points.get_mut(point_id.0 as usize)
             && core::mem::take(&mut out.cov_pending)
         {
             sink(CovEvent {
@@ -808,7 +830,6 @@ fn revoke_lease_slot(
             });
         }
     }
-    slot.points.clear();
     visited
 }
 
@@ -927,4 +948,110 @@ fn u64_reaches_deadband(diff: u64, deadband: f64) -> bool {
         floor_int
     };
     diff >= min_diff
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Builds a lease holding three outputs in index order.
+    fn setup(changed: bool) -> (Kernel, LeaseId, [PointId; 3]) {
+        let mut kernel = Kernel::new(Capacities {
+            points: 3,
+            leases: 1,
+            points_per_lease: 3,
+        });
+        let lease = kernel.issue_lease(Millis(100), Millis(0)).unwrap();
+        let mut ids = [PointId(0); 3];
+        for (index, id) in ids.iter_mut().enumerate() {
+            *id = kernel.register_output(Value::I64(0)).unwrap();
+            let value = if changed {
+                i64::try_from(index).unwrap() + 1
+            } else {
+                0
+            };
+            kernel
+                .command(
+                    lease,
+                    *id,
+                    Priority::MANUAL_OPERATOR,
+                    Value::I64(value),
+                    Millis(0),
+                    &mut |_| {},
+                )
+                .unwrap();
+        }
+        (kernel, lease, ids)
+    }
+
+    /// Checks that the revoked lease retains no pending cleanup.
+    fn assert_clean(kernel: &Kernel) {
+        assert_eq!(kernel.leases[0].points, [] as [PointId; 0]);
+        for point in &kernel.points {
+            if let Point::Output(output) = point {
+                assert!(!output.cov_pending);
+            }
+        }
+    }
+
+    /// A panic on the first event cleans every indexed output.
+    #[test]
+    fn revoke_sink_panics_first_cleans_index_and_flags() {
+        let (mut kernel, lease, _) = setup(true);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            kernel.revoke(lease, &mut |_| panic!("sink")).unwrap();
+        }));
+        assert!(result.is_err());
+        assert_clean(&kernel);
+    }
+
+    /// A panic on the last event also clears the index.
+    #[test]
+    fn revoke_sink_panics_last_cleans_index_and_flags() {
+        let (mut kernel, lease, _) = setup(true);
+        let mut count = 0;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            kernel
+                .revoke(lease, &mut |_| {
+                    count += 1;
+                    assert!(count != 3, "sink");
+                })
+                .unwrap();
+        }));
+        assert!(result.is_err());
+        assert_eq!(count, 3);
+        assert_clean(&kernel);
+    }
+
+    /// Normal revocation emits in index order and completes cleanup.
+    #[test]
+    fn revoke_emits_in_index_order_and_cleans() {
+        let (mut kernel, lease, ids) = setup(true);
+        let mut events = Vec::new();
+        assert_eq!(
+            kernel
+                .revoke(lease, &mut |event| events.push(event))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            events.iter().map(|event| event.point).collect::<Vec<_>>(),
+            ids
+        );
+        assert!(events.iter().all(|event| event.value == Value::I64(0)));
+        assert_clean(&kernel);
+    }
+
+    /// Unchanged outputs emit no events and still clear the index.
+    #[test]
+    fn revoke_unchanged_outputs_cleans_without_events() {
+        let (mut kernel, lease, _) = setup(false);
+        let mut count = 0;
+        assert_eq!(kernel.revoke(lease, &mut |_| count += 1).unwrap(), 3);
+        assert_eq!(count, 0);
+        assert_clean(&kernel);
+    }
 }

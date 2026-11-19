@@ -28,9 +28,10 @@ requires a lease in P1.
   `Millis(u64)`, representing monotonic milliseconds passed in by the caller on
   lease calls (`issue_lease`, `renew`, `command`, `relinquish`, `expire`).
 - `telemetry` takes no time value.
-- `SharedKernel` (`crates/kernel-std/src/lib.rs`) computes `Millis` as elapsed
-  milliseconds since its construction `std::time::Instant`, saturating at
-  `u64::MAX`. Wrapping an existing kernel requires its clock origin
+- `SharedKernel` (`crates/kernel-std/src/lib.rs`) computes `Millis` as
+  the clock origin plus elapsed milliseconds since its construction
+  `std::time::Instant`, saturating at `u64::MAX`. `new` uses origin zero;
+  wrapping an existing kernel requires its clock origin
   (`crates/kernel-std/tests/adapter.rs`).
 - **Reason**: Keeping clock reads out of the core preserves deterministic
   `no_std` testing (`crates/kernel/tests/positive.rs`) and removes a system

@@ -59,6 +59,7 @@ impl std::error::Error for AdapterError {
 }
 
 /// Thread-safe adapter wrapping [`Kernel`] in a [`Mutex`] with a monotonic start [`Instant`].
+/// Time is the supplied origin plus elapsed milliseconds, saturating at `u64::MAX`.
 /// A sink may call a different adapter, but same-thread re-entry into any adapter
 /// already held by that thread returns [`AdapterError::Reentrant`].
 #[derive(Debug)]
@@ -77,7 +78,7 @@ impl Default for SharedKernel {
 
 impl SharedKernel {
     /// Creates a new [`SharedKernel`] with pre-allocated `capacities` and captures
-    /// the monotonic start instant.
+    /// the monotonic start instant with a zero millisecond origin.
     #[must_use]
     pub fn new(capacities: Capacities) -> Self {
         Self::from_kernel(Kernel::new(capacities), Millis(0))
@@ -303,7 +304,7 @@ impl SharedKernel {
         Ok(ActiveGuard { guard })
     }
 
-    /// Milliseconds since construction, saturating at `u64::MAX`.
+    /// Origin plus elapsed milliseconds since construction, saturating at `u64::MAX`.
     fn now_millis(&self) -> Millis {
         let elapsed = self.start.elapsed().as_millis();
         let ms = u64::try_from(elapsed).unwrap_or(u64::MAX);
