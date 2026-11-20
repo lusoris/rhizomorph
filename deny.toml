@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+
+[licenses]
+allow = [
+    "EUPL-1.2",
+    "MIT",
+    "Apache-2.0",
+    "MPL-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+]
+confidence-threshold = 0.8
+# The allow list is the dependency policy of docs/adr/0005-licence.md, kept
+# whole before the dependencies that use it arrive; an unused entry is not a
+# finding.
+unused-allowed-license = "allow"
+
+[licenses.private]
+ignore = false

@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Planted negative fixture crate under an allowed licence that depends on planted-gpl.
+
+[package]
+name = "planted-root"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "EUPL-1.2"
+publish = false
+
+[dependencies]
+planted-gpl = { path = "../planted-gpl" }

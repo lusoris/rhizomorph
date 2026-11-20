@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Planted negative fixture for scripts/deny-check.sh: this isolated workspace
+# pulls in a path dependency declared as GPL-3.0-only in Cargo metadata so
+# cargo-deny must reject it against root deny.toml.
+
+[workspace]
+resolver = "3"
+members = ["planted-root", "planted-gpl"]

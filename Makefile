@@ -23,7 +23,7 @@ audit:
 secrets:
 	@if command -v gitleaks >/dev/null 2>&1; then $(PRAETORCTL) security secrets; else echo gitleaks is not installed, install it with mise use --global gitleaks@8.30.1 or the gitleaks v8.30.1 release archive binary - a Go-built gitleaks lacks the version stamp and shadows the pinned binary when earlier on PATH e.g. ~/go/bin >&2; exit 1; fi
 test: build
-	@printf '%s\n' 'test: not applicable: no build system; verify-all checks agent context, caveman sources and audit.'
+	@exec 'cargo' 'test' '--locked'
 
 build:
-	@printf '%s\n' 'build: not applicable: no build system; verify-all checks agent context, caveman sources and audit.'
+	@exec 'cargo' 'build' '--locked'
