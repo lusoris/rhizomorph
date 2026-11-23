@@ -4,6 +4,10 @@ bin/
 .DS_Store
 /target/
 
+
+/site/
+__pycache__/
+
 # BEGIN praetor private artifacts (praetorctl adopt)
 .workingdir/
 .workingdir2/
@@ -16,6 +20,3 @@ bin/
 .github/instructions/codacy.instructions.md
 .cursor/rules/codacy.mdc
 # END praetor private artifacts
-
-/site/
-__pycache__/
