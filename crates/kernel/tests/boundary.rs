@@ -5,8 +5,8 @@
 
 use core::mem::size_of;
 use kernel::{
-    Capacities, CapacityKind, CovEvent, Kernel, KernelError, LeaseId, Millis, Priority,
-    PriorityArray, Value, ValueKind,
+    AssetId, AssetRevision, Capacities, CapacityKind, CovEvent, Kernel, KernelError, LeaseId,
+    Millis, Priority, PriorityArray, Revision, RevisionError, Value, ValueKind,
 };
 
 /// Exit check, boundary: `Priority` 1 and 16 are accepted and arbitrate.
@@ -412,4 +412,24 @@ fn revoke_unchanged_value_emits_no_event() {
     let mut events = Vec::new();
     k.revoke(lease, &mut |event| events.push(event)).unwrap();
     assert_eq!(events, [] as [kernel::CovEvent; 0]);
+}
+
+/// Exit check, boundary: maximum revision is valid but cannot advance.
+#[test]
+fn revision_maximum_and_exhaustion() {
+    let max = Revision::new(u32::MAX).unwrap();
+    assert_eq!(max.get(), u32::MAX);
+    assert_eq!(max.next(), Err(RevisionError::Exhausted));
+    assert_eq!(
+        AssetRevision::new(AssetId(1), max).next(),
+        Err(RevisionError::Exhausted)
+    );
+    assert_eq!(Revision::new(u32::MAX - 1).unwrap().next(), Ok(max));
+}
+
+/// Exit check, boundary: revision types retain their compact layouts.
+#[test]
+fn revision_layouts_are_compact() {
+    assert_eq!(size_of::<Option<Revision>>(), size_of::<u32>());
+    assert_eq!(size_of::<AssetRevision>(), 8);
 }

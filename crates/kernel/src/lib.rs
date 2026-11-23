@@ -65,6 +65,158 @@ impl LeaseId {
     }
 }
 
+/// Reason a revision could not be created or advanced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RevisionError {
+    /// Revision numbers start at one.
+    Zero,
+    /// Advancing would exceed `u32::MAX`.
+    Exhausted,
+}
+
+impl fmt::Display for RevisionError {
+    /// Describes the error in one line.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => f.write_str("revision number must be nonzero"),
+            Self::Exhausted => f.write_str("revision counter exhausted at u32::MAX"),
+        }
+    }
+}
+
+impl core::error::Error for RevisionError {}
+
+/// Validated revision number in `1..=u32::MAX`.
+///
+/// Revision 1 is the first released state of a design model or the first
+/// commissioned state of an asset; each later change takes the next number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Revision(core::num::NonZeroU32);
+
+impl Revision {
+    /// The first revision.
+    pub const FIRST: Self = Self(core::num::NonZeroU32::MIN);
+
+    /// Creates a revision from a nonzero number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionError::Zero`] if `number` is zero.
+    pub const fn new(number: u32) -> Result<Self, RevisionError> {
+        match core::num::NonZeroU32::new(number) {
+            Some(number) => Ok(Self(number)),
+            None => Err(RevisionError::Zero),
+        }
+    }
+
+    /// Returns the revision number.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// Advances to the next revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionError::Exhausted`] at `u32::MAX`.
+    pub const fn next(self) -> Result<Self, RevisionError> {
+        match self.0.checked_add(1) {
+            Some(number) => Ok(Self(number)),
+            None => Err(RevisionError::Exhausted),
+        }
+    }
+}
+
+/// Host-assigned identifier of a commissioned asset (device or plant item) the kernel operates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AssetId(pub u32);
+
+impl AssetId {
+    /// Returns the raw numeric identifier.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Host-assigned identifier of a design model, such as a Tornus design, used to commission assets.
+/// The host maps external names to numbers; the kernel stores numbers only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModelId(pub u32);
+
+impl ModelId {
+    /// Returns the raw numeric identifier.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Identity of one revision of a subject: an asset ([`AssetRevision`]) or a
+/// design model ([`ModelRevision`]).
+///
+/// The subject type keeps asset and model revisions apart at compile time.
+/// Identities order by subject first, then by revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RevisionIdentity<S> {
+    subject: S,
+    revision: Revision,
+}
+
+impl<S: Copy> RevisionIdentity<S> {
+    /// Creates an identity for a subject and revision.
+    #[must_use]
+    pub const fn new(subject: S, revision: Revision) -> Self {
+        Self { subject, revision }
+    }
+
+    /// Creates the first identity for a subject.
+    #[must_use]
+    pub const fn first(subject: S) -> Self {
+        Self::new(subject, Revision::FIRST)
+    }
+
+    /// Returns the subject.
+    #[must_use]
+    pub const fn subject(self) -> S {
+        self.subject
+    }
+
+    /// Returns the revision.
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    /// Advances the revision while retaining the subject.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevisionError::Exhausted`] at `u32::MAX`.
+    pub const fn next(self) -> Result<Self, RevisionError> {
+        match self.revision.next() {
+            Ok(revision) => Ok(Self::new(self.subject, revision)),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl<S: Copy + PartialEq> RevisionIdentity<S> {
+    /// Returns whether this identity is a later revision of the same subject.
+    #[must_use]
+    pub fn supersedes(self, other: Self) -> bool {
+        self.subject == other.subject && self.revision > other.revision
+    }
+}
+
+/// Commissioned state of one asset at a particular revision.
+pub type AssetRevision = RevisionIdentity<AssetId>;
+
+/// Released revision of one design model.
+pub type ModelRevision = RevisionIdentity<ModelId>;
+
 /// Discriminant for [`Value`] variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueKind {

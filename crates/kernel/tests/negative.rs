@@ -4,8 +4,8 @@
 //! Negative integration tests for `kernel`.
 
 use kernel::{
-    Capacities, CapacityKind, Kernel, KernelError, LeaseId, Millis, PointId, Priority, Value,
-    ValueKind,
+    AssetId, AssetRevision, Capacities, CapacityKind, Kernel, KernelError, LeaseId, Millis,
+    PointId, Priority, Revision, RevisionError, Value, ValueKind,
 };
 
 /// Exit check, negative: NaN and infinities are refused at telemetry, command and relinquish
@@ -361,4 +361,31 @@ fn revocation_finishes_state_before_panicking_sink() {
         )
         .unwrap();
     }
+}
+
+/// Exit check, negative: zero is not a valid revision.
+#[test]
+fn revision_zero_is_rejected() {
+    assert_eq!(Revision::new(0), Err(RevisionError::Zero));
+}
+
+/// Exit check, negative: supersession requires the same subject and a higher revision.
+#[test]
+fn revision_supersession_requires_same_subject_and_higher_revision() {
+    let first = AssetRevision::first(AssetId(1));
+    let third = AssetRevision::new(AssetId(1), Revision::new(3).unwrap());
+    let other = AssetRevision::first(AssetId(2));
+    assert!(!first.supersedes(first));
+    assert!(!first.supersedes(third));
+    assert!(!third.supersedes(other));
+}
+
+/// Exit check, negative: revision errors have distinct nonempty descriptions.
+#[test]
+fn revision_error_descriptions_are_distinct() {
+    let zero = RevisionError::Zero.to_string();
+    let exhausted = RevisionError::Exhausted.to_string();
+    assert_ne!(zero, "");
+    assert_ne!(exhausted, "");
+    assert_ne!(zero, exhausted);
 }
