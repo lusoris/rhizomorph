@@ -4,7 +4,8 @@
 //! Positive integration tests for `kernel`.
 
 use kernel::{
-    Capacities, CovEvent, Kernel, KernelError, LeaseId, Millis, PointId, Priority, Value, ValueKind,
+    AssetId, AssetRevision, Capacities, CovEvent, Kernel, KernelError, LeaseId, Millis, ModelId,
+    ModelRevision, PointId, Priority, Revision, Value, ValueKind,
 };
 
 /// Exit check, positive: the lowest level number holding a value wins.
@@ -495,4 +496,45 @@ fn revoke_emits_changed_points_in_index_order() {
     k.revoke(lease, &mut |event| events.push(event.point))
         .unwrap();
     assert_eq!(events, points);
+}
+
+/// Exit check, positive: revisions start at one and advance.
+#[test]
+fn revision_creation_and_advance() {
+    assert_eq!(Revision::new(1), Ok(Revision::FIRST));
+    assert_eq!(Revision::new(7).unwrap().get(), 7);
+    assert_eq!(Revision::FIRST.next().unwrap().get(), 2);
+}
+
+/// Exit check, positive: asset and model identities retain their subject and advance.
+#[test]
+fn revision_identities_advance() {
+    let asset = AssetRevision::first(AssetId(4));
+    let model = ModelRevision::new(ModelId(9), Revision::FIRST);
+    assert_eq!(asset.subject().as_u32(), 4);
+    assert_eq!(model.subject().as_u32(), 9);
+    assert_eq!(asset.revision(), Revision::FIRST);
+    assert_eq!(model.revision(), Revision::FIRST);
+    assert_eq!(
+        asset.next().unwrap(),
+        AssetRevision::new(AssetId(4), Revision::new(2).unwrap())
+    );
+    assert_eq!(
+        model.next().unwrap(),
+        ModelRevision::new(ModelId(9), Revision::new(2).unwrap())
+    );
+    assert!(asset.next().unwrap().supersedes(asset));
+    assert!(model.next().unwrap().supersedes(model));
+    assert_eq!(ModelRevision::first(ModelId(9)), model);
+}
+
+/// Exit check, positive: identities order by subject before revision.
+#[test]
+fn revision_identity_ordering() {
+    let first = AssetRevision::first(AssetId(1));
+    let later = first.next().unwrap();
+    let other = AssetRevision::first(AssetId(2));
+    let mut values = [other, later, first];
+    values.sort();
+    assert_eq!(values, [first, later, other]);
 }
