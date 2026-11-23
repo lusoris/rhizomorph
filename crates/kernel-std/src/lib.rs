@@ -11,8 +11,9 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Instant;
 
 pub use kernel::{
-    Capacities, CapacityKind, CovEvent, DEFAULT_LEASES, DEFAULT_POINTS, DEFAULT_POINTS_PER_LEASE,
-    Kernel, KernelError, LeaseId, Millis, PointId, Priority, PriorityArray, Value, ValueKind,
+    AssetId, AssetRevision, Capacities, CapacityKind, CovEvent, DEFAULT_LEASES, DEFAULT_POINTS,
+    DEFAULT_POINTS_PER_LEASE, Kernel, KernelError, LeaseId, Millis, ModelId, ModelRevision,
+    PointId, Priority, PriorityArray, Revision, RevisionError, RevisionIdentity, Value, ValueKind,
 };
 
 /// Error returned by [`SharedKernel`] operations.

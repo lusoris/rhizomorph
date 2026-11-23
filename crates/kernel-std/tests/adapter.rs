@@ -363,3 +363,23 @@ fn nested_call_into_poisoned_other_adapter_returns_poisoned() {
         .unwrap();
     assert_eq!(first.present_value(a), Ok(Some(Value::I64(1))));
 }
+
+/// The facade re-exports the revision identity types, so a `kernel-std` consumer needs no direct `kernel` dependency.
+#[test]
+fn facade_reexports_revision_identity_types() {
+    let asset: kernel_std::AssetRevision =
+        kernel_std::RevisionIdentity::first(kernel_std::AssetId(7));
+    let model: kernel_std::ModelRevision =
+        kernel_std::RevisionIdentity::first(kernel_std::ModelId(7));
+    assert_eq!(asset.revision(), kernel_std::Revision::FIRST);
+    assert_eq!(model.subject().as_u32(), 7);
+    assert_eq!(
+        kernel_std::Revision::new(0),
+        Err(kernel_std::RevisionError::Zero)
+    );
+    let last = kernel_std::RevisionIdentity::new(
+        kernel_std::AssetId(7),
+        kernel_std::Revision::new(u32::MAX).unwrap(),
+    );
+    assert_eq!(last.next(), Err(kernel_std::RevisionError::Exhausted));
+}
