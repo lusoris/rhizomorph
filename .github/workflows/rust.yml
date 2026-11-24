@@ -177,7 +177,9 @@ jobs:
     # cfg(unix), or cfg(target_family), so which mutants the tests catch does
     # not depend on the host OS.
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    # Legs 900 s + 600 s, each plus up to 70 s stop time
+    # (scripts/mutants-check.py), = 1640 s; 30 min leaves room for setup steps.
+    timeout-minutes: 30
     steps:
       - name: Stop on a draft pull request
         if: github.event.pull_request.draft == true

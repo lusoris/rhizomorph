@@ -26,6 +26,7 @@ ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
 # Arguments after ``cargo mutants`` shared by both legs.
 COMMON_ARGS = ("-p", "kernel", "--no-shuffle", "--timeout", "120")
 GATE_OLD_OUTPUT = Path("mutants.out.old")
+# Leg + stop time must fit mutants job timeout-minutes in .github/workflows/rust.yml.
 GATE_TIMEOUT_SECONDS = 900
 PLANTED_TIMEOUT_SECONDS = 600
 # Grace period after SIGTERM for cargo-mutants to stop its child process groups.
@@ -153,12 +154,19 @@ def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
 
     ``cargo-mutants`` starts each cargo build and test child in its own process
     group and stops those groups via ``killpg`` on ``SIGTERM``; ``SIGKILL``
-    skips that cleanup and leaves child process groups running.
+    skips that cleanup and leaves child process groups running. ``cargo-mutants``
+    waits for its children without a deadline after ``SIGTERM``, so a child that
+    ignores ``SIGTERM`` blocks it, and ``SIGKILL`` to ``cargo-mutants`` cannot
+    reach that child's process group.
     """
     proc.terminate()
     try:
         proc.wait(timeout=TERMINATE_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
+        err(
+            f"{leg_name} leg ignored SIGTERM for {TERMINATE_GRACE_SECONDS}s; "
+            "killing cargo-mutants, its build and test process groups may keep running"
+        )
         proc.kill()
     else:
         return
