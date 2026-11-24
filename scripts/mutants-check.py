@@ -4,16 +4,19 @@
 """Run the kernel mutation gate and replay excluded equivalent mutants.
 
 The gate leg runs ``cargo mutants`` with ``.cargo/mutants.toml`` and proves that
-every non-excluded kernel mutant is killed by the test suite. The planted leg
-replays only the ``exclude_re`` patterns with ``--no-config`` and proves both
-that the gate fails when a mutant survives and that every exclusion still names
-exactly one surviving equivalent mutant.
+every non-excluded kernel mutant that builds is caught by the test suite, and
+that the number of mutants that fail to build stays at or below a recorded
+ceiling. The planted leg replays only the ``exclude_re`` patterns with
+``--no-config`` and proves both that the gate fails when a mutant survives and
+that every exclusion still names exactly one surviving equivalent mutant.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -25,6 +28,7 @@ CONFIG_PATH = Path(".cargo/mutants.toml")
 ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
 # Arguments after ``cargo mutants`` shared by both legs.
 COMMON_ARGS = ("-p", "kernel", "--no-shuffle", "--timeout", "120")
+GATE_OUTPUT = Path("mutants.out")
 GATE_OLD_OUTPUT = Path("mutants.out.old")
 # Leg + stop time must fit mutants job timeout-minutes in .github/workflows/rust.yml.
 GATE_TIMEOUT_SECONDS = 900
@@ -33,9 +37,14 @@ PLANTED_TIMEOUT_SECONDS = 600
 TERMINATE_GRACE_SECONDS = 60
 # Reap deadline after SIGKILL so a stuck process cannot block indefinitely.
 KILL_WAIT_SECONDS = 10
+# Minimum whitespace-separated fields after ``)`` in /proc/<pid>/stat for pgrp.
+MIN_PROC_STAT_FIELDS = 3
 EMPTY_OUTCOME_FILES = ("caught.txt", "timeout.txt", "unviable.txt")
 # cargo-mutants exit code when at least one mutant was missed.
 MISSED_EXIT_CODE = 2
+# Unviable gate mutants measured 2026-11-24 with cap_lints (68 without); raise it
+# only in a reviewed change.
+GATE_UNVIABLE_CEILING = 31
 
 
 @dataclass(frozen=True)
@@ -149,27 +158,98 @@ def build_planted_args(config: MutantsConfig, output_dir: Path) -> list[str]:
     return args
 
 
+def read_proc_parent_pgid(entry: str) -> tuple[int, int] | None:
+    """Read ``(ppid, pgid)`` for numeric ``/proc`` ``entry``, or ``None``."""
+    # Linux only: /proc/<pid>/stat exists only on procfs platforms.
+    if not (entry.isascii() and entry.isdigit()):
+        return None
+    try:
+        stat = Path(f"/proc/{entry}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    rparen = stat.rfind(")")
+    if rparen < 0:
+        return None
+    fields = stat[rparen + 1 :].split()
+    if len(fields) < MIN_PROC_STAT_FIELDS:
+        return None
+    try:
+        return int(fields[1]), int(fields[2])
+    except ValueError:
+        return None
+
+
+def child_process_groups(pid: int) -> list[int] | None:
+    """Return distinct child process group IDs of ``pid`` from ``/proc``.
+
+    Linux only: returns ``None`` when ``/proc`` is not a directory because other
+    platforms have no ``/proc``.
+    """
+    # Linux only: other platforms have no /proc directory.
+    if not Path("/proc").is_dir():
+        return None
+    try:
+        entries = os.listdir("/proc")
+    except OSError as exc:
+        err(f"failed to list /proc: {exc}")
+        return None
+    own_pgid = os.getpgrp()
+    groups: list[int] = []
+    for idx in range(len(entries)):
+        parsed = read_proc_parent_pgid(entries[idx])
+        if parsed is None:
+            continue
+        ppid, pgid = parsed
+        if ppid == pid and pgid > 1 and pgid != own_pgid and pgid not in groups:
+            groups.append(pgid)
+    return groups
+
+
+def kill_process_group(leg_name: str, pgid: int) -> None:
+    """Send ``SIGKILL`` to process group ``pgid`` when ``pgid`` is above ``1``."""
+    if pgid <= 1:
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        err(f"{leg_name} leg failed to kill process group {pgid}: {exc}")
+
+
 def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
     """Stop a timed-out ``cargo mutants`` process with SIGTERM, then SIGKILL.
 
     ``cargo-mutants`` starts each cargo build and test child in its own process
-    group and stops those groups via ``killpg`` on ``SIGTERM``; ``SIGKILL``
-    skips that cleanup and leaves child process groups running. ``cargo-mutants``
-    waits for its children without a deadline after ``SIGTERM``, so a child that
-    ignores ``SIGTERM`` blocks it, and ``SIGKILL`` to ``cargo-mutants`` cannot
-    reach that child's process group.
+    group and waits for those groups without a deadline on ``SIGTERM``. When
+    ``SIGTERM`` times out, direct child process groups are read from ``/proc``
+    before the ``SIGKILL`` to ``cargo-mutants`` and killed by group; without
+    ``/proc`` they may keep running.
     """
     proc.terminate()
     try:
         proc.wait(timeout=TERMINATE_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
+        pass
+    else:
+        return
+    groups = child_process_groups(proc.pid)
+    if groups is None:
         err(
             f"{leg_name} leg ignored SIGTERM for {TERMINATE_GRACE_SECONDS}s; "
-            "killing cargo-mutants, its build and test process groups may keep running"
+            "killing cargo-mutants, its build and test process groups may keep "
+            "running"
         )
         proc.kill()
     else:
-        return
+        err(
+            f"{leg_name} leg ignored SIGTERM for {TERMINATE_GRACE_SECONDS}s; "
+            f"killing cargo-mutants and {len(groups)} build and test process "
+            "groups"
+        )
+        proc.kill()
+        for idx in range(len(groups)):
+            kill_process_group(leg_name, groups[idx])
     try:
         proc.wait(timeout=KILL_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -302,7 +382,7 @@ def run_planted_leg(config: MutantsConfig) -> int:
 
 
 def run_gate_leg() -> int:
-    """Execute the default gate leg and remove any unignored ``.old`` backup."""
+    """Execute the gate leg, remove ``.old`` output, and check unviable count."""
     gate_rc = run_leg("gate", list(COMMON_ARGS), GATE_TIMEOUT_SECONDS)
     if GATE_OLD_OUTPUT.exists():
         try:
@@ -315,6 +395,25 @@ def run_gate_leg() -> int:
     if gate_rc != 0:
         err(f"gate leg failed (cargo-mutants exit {gate_rc})")
         return 1
+    lines = read_outcome_file(GATE_OUTPUT, "unviable.txt")
+    if lines is None:
+        return 1
+    n = 0
+    for idx in range(len(lines)):
+        if lines[idx]:
+            n += 1
+    if n > GATE_UNVIABLE_CEILING:
+        err(
+            f"gate leg: {n} unviable mutants exceed the ceiling of "
+            f"{GATE_UNVIABLE_CEILING}; a config or code change stopped them "
+            "from building"
+        )
+        return 1
+    if n < GATE_UNVIABLE_CEILING:
+        print(
+            f"mutants-check: gate unviable {n} below ceiling "
+            f"{GATE_UNVIABLE_CEILING}; lower GATE_UNVIABLE_CEILING"
+        )
     return 0
 
 
