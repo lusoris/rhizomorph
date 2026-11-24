@@ -23,7 +23,8 @@ from pathlib import Path
 
 CONFIG_PATH = Path(".cargo/mutants.toml")
 ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
-COMMON_ARGV = ("cargo", "mutants", "-p", "kernel", "--no-shuffle", "--timeout", "120")
+# Arguments after ``cargo mutants`` shared by both legs.
+COMMON_ARGS = ("-p", "kernel", "--no-shuffle", "--timeout", "120")
 GATE_OLD_OUTPUT = Path("mutants.out.old")
 GATE_TIMEOUT_SECONDS = 900
 PLANTED_TIMEOUT_SECONDS = 600
@@ -130,25 +131,31 @@ def load_config(path: Path) -> tuple[MutantsConfig | None, int]:
     return MutantsConfig(exclusions, cargo_args, cap_lints), 0
 
 
-def build_planted_argv(config: MutantsConfig, output_dir: Path) -> list[str]:
-    """Build the ``--no-config`` command line mirroring ``config``."""
-    argv = [*COMMON_ARGV, "--no-config", "--output", str(output_dir)]
+def build_planted_args(config: MutantsConfig, output_dir: Path) -> list[str]:
+    """Build the ``--no-config`` arguments mirroring ``config``."""
+    args = [*COMMON_ARGS, "--no-config", "--output", str(output_dir)]
     if config.cap_lints:
-        argv.extend(["--cap-lints", "true"])
+        args.extend(["--cap-lints", "true"])
     for idx in range(len(config.additional_cargo_args)):
-        argv.append(f"--cargo-arg={config.additional_cargo_args[idx]}")
+        args.append(f"--cargo-arg={config.additional_cargo_args[idx]}")
     for idx in range(len(config.exclude_re)):
         pattern, _ = config.exclude_re[idx]
-        argv.extend(["-F", pattern])
-    return argv
+        args.extend(["-F", pattern])
+    return args
 
 
-def run_leg(leg_name: str, argv: list[str], timeout_seconds: int) -> int | None:
-    """Run one ``cargo mutants`` leg with an explicit timeout."""
+def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
+    """Run ``cargo mutants`` with ``args`` and an explicit timeout.
+
+    The executable and subcommand are literals, so only arguments vary, and
+    each element of ``args`` reaches cargo as one argument without a shell.
+    """
     sys.stdout.flush()
     sys.stderr.flush()
     try:
-        completed = subprocess.run(argv, timeout=timeout_seconds, check=False)
+        completed = subprocess.run(
+            ["cargo", "mutants", *args], timeout=timeout_seconds, check=False
+        )
     except subprocess.TimeoutExpired:
         err(f"{leg_name} leg exceeded its {timeout_seconds}s deadline")
         return None
@@ -236,8 +243,8 @@ def run_planted_leg(config: MutantsConfig) -> int:
     """Execute the planted leg in a temporary directory and verify outcomes."""
     with tempfile.TemporaryDirectory(prefix="mutants-check-") as tmp_dir:
         output_dir = Path(tmp_dir)
-        argv = build_planted_argv(config, output_dir)
-        rc = run_leg("planted", argv, PLANTED_TIMEOUT_SECONDS)
+        args = build_planted_args(config, output_dir)
+        rc = run_leg("planted", args, PLANTED_TIMEOUT_SECONDS)
         if rc is None:
             return 1
         mutants_out = output_dir / "mutants.out"
@@ -263,7 +270,7 @@ def run_planted_leg(config: MutantsConfig) -> int:
 
 def run_gate_leg() -> int:
     """Execute the default gate leg and remove any unignored ``.old`` backup."""
-    gate_rc = run_leg("gate", list(COMMON_ARGV), GATE_TIMEOUT_SECONDS)
+    gate_rc = run_leg("gate", list(COMMON_ARGS), GATE_TIMEOUT_SECONDS)
     if GATE_OLD_OUTPUT.exists():
         try:
             shutil.rmtree(GATE_OLD_OUTPUT)
