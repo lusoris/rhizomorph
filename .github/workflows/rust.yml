@@ -4,7 +4,8 @@
 #
 # Rust workspace gate: runs workspace unit and integration tests, the
 # thumbv7em-none-eabihf no_std build of kernel, clippy lints, rustfmt check,
-# and cargo-deny dependency licence verification (with planted negative check).
+# cargo-deny dependency licence verification (with planted negative check),
+# and cargo-mutants kernel mutation testing.
 name: Rust
 
 'on':
@@ -169,3 +170,36 @@ jobs:
       - name: Verify dependency licences
         if: github.event.pull_request.draft != true
         run: sh scripts/deny-check.sh
+
+  mutants:
+    name: mutants
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - name: Check out the source
+        if: github.event.pull_request.draft != true
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cargo-mutants
+        if: github.event.pull_request.draft != true
+        # yamllint disable-line rule:line-length
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: Run kernel mutation tests
+        if: github.event.pull_request.draft != true
+        run: cargo mutants -p kernel --no-shuffle --timeout 120
