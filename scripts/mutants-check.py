@@ -30,8 +30,13 @@ from types import FrameType
 
 CONFIG_PATH = Path(".cargo/mutants.toml")
 ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
-# Arguments after ``cargo mutants`` shared by both legs.
-COMMON_ARGS = ("-p", "kernel", "--no-shuffle", "--timeout", "120")
+# Arguments after ``cargo mutants`` shared by both legs. ``--jobs 1`` runs one
+# mutant build+test at a time as an explicit HISS-06 worker bound; the default
+# was measured at 1 worker (one ``start thread`` in ``mutants.out/debug.log`` on
+# ``cargo-mutants`` 27.1.0 on a 32-CPU host), so counts and timing are
+# unchanged, while the ``cargo-mutants`` jobserver caps compile tasks at the CPU
+# count.
+COMMON_ARGS = ("-p", "kernel", "--jobs", "1", "--no-shuffle", "--timeout", "120")
 GATE_OUTPUT = Path("mutants.out")
 GATE_OLD_OUTPUT = Path("mutants.out.old")
 # Leg + stop time must fit mutants job timeout-minutes in .github/workflows/rust.yml;
@@ -56,6 +61,10 @@ CLEANUP_ROUND_WAIT_SECONDS = 0.2
 CANCEL_SIGNALS: list[int] = []
 # Minimum whitespace-separated fields after ``)`` in /proc/<pid>/stat for session.
 MIN_PROC_STAT_FIELDS = 4
+PROC_STAT_PARSED = "parsed"
+PROC_STAT_VANISHED = "vanished"
+PROC_STAT_FAILED = "failed"
+SIGNAL_EXIT_BASE = 128
 EMPTY_OUTCOME_FILES = ("caught.txt", "timeout.txt", "unviable.txt")
 # cargo-mutants exit code when at least one mutant was missed.
 MISSED_EXIT_CODE = 2
@@ -88,6 +97,15 @@ class LegCancelled(Exception):
         super().__init__(signum)
 
 
+@dataclass(frozen=True)
+class ProcStatRead:
+    """Outcome of reading ``/proc/<pid>/stat`` for one process entry."""
+
+    status: str
+    parsed: tuple[str, int] | None = None
+    error: str | None = None
+
+
 def err(message: str) -> None:
     """Write a prefixed diagnostic message to standard error."""
     print(f"mutants-check: {message}", file=sys.stderr)
@@ -100,6 +118,15 @@ def request_cancel(signum: int, frame: FrameType | None) -> None:
     """
     if not CANCEL_SIGNALS:
         CANCEL_SIGNALS.append(signum)
+
+
+def cancel_status() -> int | None:
+    """Report the first recorded cancellation signal and return its exit code."""
+    if not CANCEL_SIGNALS:
+        return None
+    signum = CANCEL_SIGNALS[0]
+    err(f"cancelled by {signal.Signals(signum).name}")
+    return SIGNAL_EXIT_BASE + signum
 
 
 def parse_string_list(raw: object, key: str, path: Path) -> list[str] | None:
@@ -236,20 +263,12 @@ def signal_leg(proc: subprocess.Popen[bytes], sig: int) -> None:
             return
 
 
-def read_proc_state_session(entry: str) -> tuple[str, int] | None:
-    """Read ``(state, session)`` for numeric ``/proc`` ``entry``, or ``None``."""
-    # Linux only: /proc/<pid>/stat exists only on procfs platforms (proc(5)
-    # field 3 state, field 6 session).
-    if not (entry.isascii() and entry.isdigit()):
-        return None
-    try:
-        stat = Path(f"/proc/{entry}/stat").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    rparen = stat.rfind(")")
+def parse_proc_stat(text: str) -> tuple[str, int] | None:
+    """Parse ``(state, session)`` from ``/proc/<pid>/stat`` content ``text``."""
+    rparen = text.rfind(")")
     if rparen < 0:
         return None
-    fields = stat[rparen + 1 :].split()
+    fields = text[rparen + 1 :].split()
     if len(fields) < MIN_PROC_STAT_FIELDS:
         return None
     try:
@@ -258,17 +277,43 @@ def read_proc_state_session(entry: str) -> tuple[str, int] | None:
         return None
 
 
+def read_proc_state_session(entry: str) -> ProcStatRead:
+    """Read ``(state, session)`` for numeric ``/proc`` ``entry``.
+
+    Returns ``PROC_STAT_PARSED`` with ``(state, session)``,
+    ``PROC_STAT_VANISHED`` when ``entry`` is non-numeric or exited before the
+    read, and ``PROC_STAT_FAILED`` with a reason when ``stat`` could not be read
+    or parsed.
+    """
+    # Linux only: /proc/<pid>/stat exists only on procfs platforms (proc(5)
+    # field 3 state, field 6 session).
+    if not (entry.isascii() and entry.isdigit()):
+        return ProcStatRead(PROC_STAT_VANISHED)
+    stat_path = Path(f"/proc/{entry}/stat")
+    try:
+        stat = stat_path.read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return ProcStatRead(PROC_STAT_VANISHED)
+    except OSError as exc:
+        return ProcStatRead(PROC_STAT_FAILED, error=f"cannot read {stat_path}: {exc}")
+    parsed = parse_proc_stat(stat)
+    if parsed is None:
+        return ProcStatRead(PROC_STAT_FAILED, error=f"malformed {stat_path}")
+    return ProcStatRead(PROC_STAT_PARSED, parsed=parsed)
+
+
 def session_live_pids(sid: int) -> list[int] | None:
     """Return live descendant PIDs in session ``sid`` from ``/proc``.
 
-    Linux only: returns ``None`` when ``/proc`` is not a directory or cannot be
-    listed. Excludes zombies, dead processes, the held session leader ``sid``,
-    and the current process.
+    Linux only: returns ``None`` when ``/proc`` is not a directory, cannot be
+    listed, or has an unreadable or unparseable numeric ``stat`` entry. Excludes
+    zombies, dead processes, the held session leader ``sid``, and the current
+    process.
     """
     # Linux only: other platforms have no /proc directory.
-    if not Path("/proc").is_dir():
-        return None
     try:
+        if not Path("/proc").is_dir():
+            return None
         entries = os.listdir("/proc")
     except OSError as exc:
         err(f"failed to list /proc: {exc}")
@@ -277,14 +322,31 @@ def session_live_pids(sid: int) -> list[int] | None:
     pids: list[int] = []
     for idx in range(len(entries)):
         entry = entries[idx]
-        parsed = read_proc_state_session(entry)
-        if parsed is None:
+        if not (entry.isascii() and entry.isdigit()):
             continue
-        state, session = parsed
+        result = read_proc_state_session(entry)
+        if result.status == PROC_STAT_FAILED:
+            err(f"failed to inspect process {entry}: {result.error}")
+            return None
+        if result.parsed is None:
+            continue
+        state, session = result.parsed
         pid = int(entry)
         if session == sid and state not in ("Z", "X") and pid not in (sid, own_pid):
             pids.append(pid)
     return pids
+
+
+def send_pidfd_kill(leg_name: str, fd: int, pid: int) -> bool:
+    """Send ``SIGKILL`` via ``fd``, ignoring a process that already exited."""
+    try:
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except OSError as exc:
+        err(f"{leg_name} leg failed to kill {pid}: {exc}")
+        return False
+    return True
 
 
 def kill_verified(leg_name: str, pid: int, sid: int) -> bool:
@@ -297,24 +359,26 @@ def kill_verified(leg_name: str, pid: int, sid: int) -> bool:
         return True
     try:
         fd = os.pidfd_open(pid)
-    except ProcessLookupError:
+    except (FileNotFoundError, ProcessLookupError):
         return True
     except OSError as exc:
         err(f"{leg_name} leg failed to open pidfd for {pid}: {exc}")
         return False
+    verified = True
     try:
-        parsed = read_proc_state_session(str(pid))
-        if parsed is not None and parsed[1] == sid:
-            try:
-                signal.pidfd_send_signal(fd, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError as exc:
-                err(f"{leg_name} leg failed to kill {pid}: {exc}")
-                return False
-        return True
+        result = read_proc_state_session(str(pid))
+        if result.status == PROC_STAT_FAILED:
+            err(f"{leg_name} leg failed to verify {pid}: {result.error}")
+            verified = False
+        elif result.parsed is not None and result.parsed[1] == sid:
+            verified = send_pidfd_kill(leg_name, fd, pid)
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError as exc:
+            err(f"{leg_name} leg failed to close pidfd for {pid}: {exc}")
+            verified = False
+    return verified
 
 
 def kill_session_leftovers(leg_name: str, sid: int, reason: str) -> bool:
@@ -385,6 +449,21 @@ def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
         err(f"{leg_name} leg did not exit after kill")
 
 
+def reap_exited_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> int | None:
+    """Clean up session leftovers and reap ``proc`` after it has exited."""
+    cleaned = kill_session_leftovers(leg_name, proc.pid, "exited")
+    reaped_rc: int | None = None
+    try:
+        reaped_rc = proc.wait(timeout=KILL_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        err(f"{leg_name} leg did not reap after exit")
+    if CANCEL_SIGNALS:
+        raise LegCancelled(CANCEL_SIGNALS[0])
+    if reaped_rc is None or not cleaned:
+        return None
+    return reaped_rc
+
+
 def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
     """Run ``cargo mutants`` with ``args`` and a bounded SIGTERM-then-kill deadline.
 
@@ -394,10 +473,11 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
     its session after it exits are killed while the unreaped ``cargo-mutants``
     zombie holds the session ID, and the leg fails when cleanup cannot be
     verified. Exceeding ``timeout_seconds`` stops the leg with ``SIGTERM`` then
-    ``SIGKILL``. A ``SIGINT`` or ``SIGTERM`` to the script is recorded by
-    ``request_cancel`` and stops the leg the same way within
-    ``LEG_POLL_SECONDS``, then ``LegCancelled`` is raised; the return value is
-    unchanged otherwise.
+    ``SIGKILL``. A ``SIGINT`` or ``SIGTERM`` recorded by ``request_cancel``
+    stops a running leg within ``LEG_POLL_SECONDS``, and ``LegCancelled`` is
+    raised if a signal arrived before start, during the poll, during exit
+    cleanup and reap, or during a deadline stop rather than returning ``rc`` or
+    ``None``.
     """
     sys.stdout.flush()
     sys.stderr.flush()
@@ -407,6 +487,8 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
         proc = subprocess.Popen(["cargo", "mutants", *args], start_new_session=True)
     except OSError as exc:
         err(f"{leg_name} leg failed to start cargo-mutants: {exc}")
+        if CANCEL_SIGNALS:
+            raise LegCancelled(CANCEL_SIGNALS[0]) from exc
         return None
     deadline = time.monotonic() + timeout_seconds
     for _ in range(timeout_seconds // LEG_POLL_SECONDS + 2):
@@ -420,19 +502,12 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        if not wait_exited(proc.pid, min(LEG_POLL_SECONDS, remaining)):
-            continue
-        cleaned = kill_session_leftovers(leg_name, proc.pid, "exited")
-        try:
-            rc = proc.wait(timeout=KILL_WAIT_SECONDS)
-        except subprocess.TimeoutExpired:
-            err(f"{leg_name} leg did not reap after exit")
-            return None
-        if not cleaned:
-            return None
-        return rc
+        if wait_exited(proc.pid, min(LEG_POLL_SECONDS, remaining)):
+            return reap_exited_leg(leg_name, proc)
     err(f"{leg_name} leg exceeded its {timeout_seconds}s deadline")
     stop_leg(leg_name, proc)
+    if CANCEL_SIGNALS:
+        raise LegCancelled(CANCEL_SIGNALS[0])
     return None
 
 
@@ -627,15 +702,22 @@ def main() -> int:
     signal.signal(signal.SIGTERM, request_cancel)
     config, status = load_config(CONFIG_PATH)
     if config is None:
-        return status
+        cancelled = cancel_status()
+        return cancelled if cancelled is not None else status
     try:
-        gate_status = run_gate_leg()
-        if gate_status != 0:
-            return gate_status
-        return run_planted_leg(config)
+        leg_status = run_gate_leg()
+        cancelled = cancel_status()
+        if cancelled is not None:
+            return cancelled
+        if leg_status == 0:
+            leg_status = run_planted_leg(config)
+            cancelled = cancel_status()
+            if cancelled is not None:
+                return cancelled
+        return leg_status
     except LegCancelled as exc:
         err(f"cancelled by {signal.Signals(exc.signum).name}")
-        return 128 + exc.signum
+        return SIGNAL_EXIT_BASE + exc.signum
 
 
 if __name__ == "__main__":
