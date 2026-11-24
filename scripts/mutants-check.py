@@ -8,7 +8,9 @@ every non-excluded kernel mutant that builds is caught by the test suite, and
 that the number of mutants that fail to build stays at or below a recorded
 ceiling. The planted leg replays only the ``exclude_re`` patterns with
 ``--no-config`` and proves both that the gate fails when a mutant survives and
-that every exclusion still names exactly one surviving equivalent mutant.
+that every exclusion still names exactly one surviving equivalent mutant. Linux
+only: the cleanup reads ``/proc`` and kills through pidfds, and a leg whose
+cleanup cannot be verified fails.
 """
 
 from __future__ import annotations
@@ -32,7 +34,9 @@ ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
 COMMON_ARGS = ("-p", "kernel", "--no-shuffle", "--timeout", "120")
 GATE_OUTPUT = Path("mutants.out")
 GATE_OLD_OUTPUT = Path("mutants.out.old")
-# Leg + stop time must fit mutants job timeout-minutes in .github/workflows/rust.yml.
+# Leg + stop time must fit mutants job timeout-minutes in .github/workflows/rust.yml;
+# cleanup adds at most CLEANUP_ROUNDS * CLEANUP_ROUND_WAIT_SECONDS = 1 s per leg end,
+# inside the step timeout headroom.
 GATE_TIMEOUT_SECONDS = 900
 PLANTED_TIMEOUT_SECONDS = 600
 # Grace period after SIGTERM for cargo-mutants to stop its child process groups.
@@ -42,6 +46,12 @@ KILL_WAIT_SECONDS = 10
 # Upper bound on the delay between a recorded SIGINT/SIGTERM and the start of
 # the leg stop.
 LEG_POLL_SECONDS = 1
+# Poll interval while waiting for cargo-mutants to exit without reaping it.
+EXIT_POLL_SECONDS = 0.05
+# Maximum /proc kill rounds run at the end of a leg; a final scan follows the last.
+CLEANUP_ROUNDS = 5
+# Wait between /proc scan-and-kill rounds so killed processes can exit.
+CLEANUP_ROUND_WAIT_SECONDS = 0.2
 # First SIGINT or SIGTERM the script received; set only by request_cancel.
 CANCEL_SIGNALS: list[int] = []
 # Minimum whitespace-separated fields after ``)`` in /proc/<pid>/stat for session.
@@ -55,6 +65,9 @@ GATE_UNVIABLE_CEILING = 31
 # Caught gate mutants measured on CI 2026-11-24 at 3737b36 (143 tested, 31 unviable);
 # lower it only in a reviewed change.
 GATE_CAUGHT_FLOOR = 112
+# Gate mutants tested (caught + unviable), measured on CI 2026-11-24 at 3737b36
+# (112 caught, 31 unviable); lower it only in a reviewed change.
+GATE_MUTANTS_FLOOR = 143
 
 
 @dataclass(frozen=True)
@@ -186,10 +199,47 @@ def build_planted_args(config: MutantsConfig, output_dir: Path) -> list[str]:
     return args
 
 
-def read_proc_pgid_session(entry: str) -> tuple[int, int] | None:
-    """Read ``(pgid, session)`` for numeric ``/proc`` ``entry``, or ``None``."""
+def wait_exited(pid: int, timeout_seconds: float) -> bool:
+    """Wait up to ``timeout_seconds`` for child ``pid`` to exit without reaping it."""
+    if timeout_seconds < 0:
+        timeout_seconds = 0.0
+    deadline = time.monotonic() + timeout_seconds
+    for _ in range(int(timeout_seconds / EXIT_POLL_SECONDS) + 1):
+        try:
+            result = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if result is not None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(EXIT_POLL_SECONDS, remaining))
+    try:
+        return (
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None
+        )
+    except ChildProcessError:
+        return True
+
+
+def signal_leg(proc: subprocess.Popen[bytes], sig: int) -> None:
+    """Send ``sig`` to ``proc`` when ``proc.pid`` is above ``1``.
+
+    The PID is our unreaped child, so it cannot belong to another process;
+    ``Popen.send_signal`` would reap it through ``poll()``.
+    """
+    if proc.pid > 1:
+        try:
+            os.kill(proc.pid, sig)
+        except ProcessLookupError:
+            return
+
+
+def read_proc_state_session(entry: str) -> tuple[str, int] | None:
+    """Read ``(state, session)`` for numeric ``/proc`` ``entry``, or ``None``."""
     # Linux only: /proc/<pid>/stat exists only on procfs platforms (proc(5)
-    # field 5 pgrp, field 6 session).
+    # field 3 state, field 6 session).
     if not (entry.isascii() and entry.isdigit()):
         return None
     try:
@@ -203,16 +253,17 @@ def read_proc_pgid_session(entry: str) -> tuple[int, int] | None:
     if len(fields) < MIN_PROC_STAT_FIELDS:
         return None
     try:
-        return int(fields[2]), int(fields[3])
+        return fields[0], int(fields[3])
     except ValueError:
         return None
 
 
-def session_process_groups(sid: int) -> list[int] | None:
-    """Return distinct process group IDs in session ``sid`` from ``/proc``.
+def session_live_pids(sid: int) -> list[int] | None:
+    """Return live descendant PIDs in session ``sid`` from ``/proc``.
 
-    Linux only: returns ``None`` when ``/proc`` is not a directory because other
-    platforms have no ``/proc``.
+    Linux only: returns ``None`` when ``/proc`` is not a directory or cannot be
+    listed. Excludes zombies, dead processes, the held session leader ``sid``,
+    and the current process.
     """
     # Linux only: other platforms have no /proc directory.
     if not Path("/proc").is_dir():
@@ -222,83 +273,112 @@ def session_process_groups(sid: int) -> list[int] | None:
     except OSError as exc:
         err(f"failed to list /proc: {exc}")
         return None
-    own_pgid = os.getpgrp()
-    groups: list[int] = []
+    own_pid = os.getpid()
+    pids: list[int] = []
     for idx in range(len(entries)):
-        parsed = read_proc_pgid_session(entries[idx])
+        entry = entries[idx]
+        parsed = read_proc_state_session(entry)
         if parsed is None:
             continue
-        pgid, session = parsed
-        if session == sid and pgid > 1 and pgid != own_pgid and pgid not in groups:
-            groups.append(pgid)
-    return groups
+        state, session = parsed
+        pid = int(entry)
+        if session == sid and state not in ("Z", "X") and pid not in (sid, own_pid):
+            pids.append(pid)
+    return pids
 
 
-def kill_process_group(leg_name: str, pgid: int) -> None:
-    """Send ``SIGKILL`` to process group ``pgid`` when ``pgid`` is above ``1``."""
-    if pgid <= 1:
-        return
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    except PermissionError as exc:
-        err(f"{leg_name} leg failed to kill process group {pgid}: {exc}")
+def kill_verified(leg_name: str, pid: int, sid: int) -> bool:
+    """Kill ``pid`` via a pidfd after re-checking that it belongs to session ``sid``.
 
-
-def kill_session_leftovers(leg_name: str, sid: int, reason: str) -> None:
-    """Kill every process group still in ``cargo-mutants`` session ``sid``.
-
-    Covers descendants that ignored ``SIGTERM`` or were reparented after
-    ``cargo-mutants`` ended; Linux only, no-op without ``/proc``. The kernel
-    keeps a session ID reserved while any process holds it, so the scan cannot
-    reach an unrelated session while leftovers exist.
+    The pidfd pins the process found at open time, so a signal sent through it
+    can never reach a process that took ``pid`` later.
     """
-    groups = session_process_groups(sid)
-    if not groups:
-        return
+    if pid <= 1:
+        return True
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    except OSError as exc:
+        err(f"{leg_name} leg failed to open pidfd for {pid}: {exc}")
+        return False
+    try:
+        parsed = read_proc_state_session(str(pid))
+        if parsed is not None and parsed[1] == sid:
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                err(f"{leg_name} leg failed to kill {pid}: {exc}")
+                return False
+        return True
+    finally:
+        os.close(fd)
+
+
+def kill_session_leftovers(leg_name: str, sid: int, reason: str) -> bool:
+    """Kill every live process remaining in ``cargo-mutants`` session ``sid``.
+
+    Runs while the ``cargo-mutants`` zombie holds the session ID; every PID is
+    re-checked through a pidfd before the signal, and ``False`` is returned when
+    cleanup cannot be verified.
+    """
+    for round_idx in range(CLEANUP_ROUNDS + 1):
+        pids = session_live_pids(sid)
+        if pids is None:
+            err(
+                f"{leg_name} leg {reason}: cannot read /proc, processes in its "
+                "session may keep running"
+            )
+            return False
+        if not pids:
+            return True
+        if round_idx == CLEANUP_ROUNDS:
+            break
+        if round_idx == 0:
+            err(
+                f"{leg_name} leg {reason} and left {len(pids)} processes in its "
+                "session; killing them"
+            )
+        all_killed = True
+        for idx in range(len(pids)):
+            if not kill_verified(leg_name, pids[idx], sid):
+                all_killed = False
+        if not all_killed:
+            return False
+        time.sleep(CLEANUP_ROUND_WAIT_SECONDS)
     err(
-        f"{leg_name} leg {reason} left {len(groups)} process groups in its "
-        "session; killing them"
+        f"{leg_name} leg {reason}: processes still running in its session "
+        f"after {CLEANUP_ROUNDS} kill rounds"
     )
-    for idx in range(len(groups)):
-        kill_process_group(leg_name, groups[idx])
+    return False
 
 
 def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
     """Stop a ``cargo mutants`` process with SIGTERM, then SIGKILL.
 
-    ``cargo-mutants`` runs in its own session and starts each cargo build and
-    test child in its own process group, waiting for those groups without a
-    deadline on ``SIGTERM``. After either stop path, remaining process groups in
-    its session, including reparented descendants, are discovered from ``/proc``
-    and killed by group; without ``/proc`` they may keep running. Signals
-    arriving during the stop are only recorded, so the stop always completes.
+    ``cargo-mutants`` runs in its own session and stays unreaped until session
+    cleanup finishes, so its PID keeps the session ID reserved while ``/proc``
+    is scanned and remaining descendants are killed via pidfds. Signals arriving
+    during the stop are only recorded, so the stop always completes.
     """
-    proc.terminate()
-    try:
-        proc.wait(timeout=TERMINATE_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        pass
+    signal_leg(proc, signal.SIGTERM)
+    if wait_exited(proc.pid, TERMINATE_GRACE_SECONDS):
+        exited = True
+        reason = "stopped by SIGTERM"
     else:
-        kill_session_leftovers(leg_name, proc.pid, "stopped by SIGTERM")
+        err(
+            f"{leg_name} leg ignored SIGTERM for {TERMINATE_GRACE_SECONDS}s; "
+            "killing cargo-mutants and its session"
+        )
+        signal_leg(proc, signal.SIGKILL)
+        exited = wait_exited(proc.pid, KILL_WAIT_SECONDS)
+        reason = "killed"
+    kill_session_leftovers(leg_name, proc.pid, reason)
+    if not exited:
+        err(f"{leg_name} leg did not exit after kill")
         return
-    proc.kill()
-    groups = session_process_groups(proc.pid)
-    if groups is None:
-        err(
-            f"{leg_name} leg ignored SIGTERM for {TERMINATE_GRACE_SECONDS}s; "
-            "killing cargo-mutants, its build and test process groups may keep "
-            "running"
-        )
-    else:
-        err(
-            f"{leg_name} leg ignored SIGTERM for {TERMINATE_GRACE_SECONDS}s; "
-            f"killing cargo-mutants and {len(groups)} process groups in its "
-            "session"
-        )
-        for idx in range(len(groups)):
-            kill_process_group(leg_name, groups[idx])
     try:
         proc.wait(timeout=KILL_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -310,12 +390,14 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
 
     The executable and subcommand are literals at the call site, each element
     of ``args`` is passed as one argv element without a shell, and the leg runs
-    in a session of its own so every descendant can be found. Process groups
-    left in its session after it exits are killed. Exceeding ``timeout_seconds``
-    stops the leg with ``SIGTERM`` then ``SIGKILL``. A ``SIGINT`` or ``SIGTERM``
-    to the script is recorded by ``request_cancel`` and stops the leg the same
-    way within ``LEG_POLL_SECONDS``, then ``LegCancelled`` is raised; the return
-    value is unchanged otherwise.
+    in a session of its own so every descendant can be found. Processes left in
+    its session after it exits are killed while the unreaped ``cargo-mutants``
+    zombie holds the session ID, and the leg fails when cleanup cannot be
+    verified. Exceeding ``timeout_seconds`` stops the leg with ``SIGTERM`` then
+    ``SIGKILL``. A ``SIGINT`` or ``SIGTERM`` to the script is recorded by
+    ``request_cancel`` and stops the leg the same way within
+    ``LEG_POLL_SECONDS``, then ``LegCancelled`` is raised; the return value is
+    unchanged otherwise.
     """
     sys.stdout.flush()
     sys.stderr.flush()
@@ -338,11 +420,16 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        try:
-            rc = proc.wait(timeout=min(LEG_POLL_SECONDS, remaining))
-        except subprocess.TimeoutExpired:
+        if not wait_exited(proc.pid, min(LEG_POLL_SECONDS, remaining)):
             continue
-        kill_session_leftovers(leg_name, proc.pid, f"exited {rc} and")
+        cleaned = kill_session_leftovers(leg_name, proc.pid, "exited")
+        try:
+            rc = proc.wait(timeout=KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            err(f"{leg_name} leg did not reap after exit")
+            return None
+        if not cleaned:
+            return None
         return rc
     err(f"{leg_name} leg exceeded its {timeout_seconds}s deadline")
     stop_leg(leg_name, proc)
@@ -464,11 +551,54 @@ def run_planted_leg(config: MutantsConfig) -> int:
         return 0
 
 
+def check_gate_counts(caught: int, unviable: int) -> bool:
+    """Verify the gate unviable ceiling, caught floor, and tested population floor."""
+    passed = True
+    if unviable > GATE_UNVIABLE_CEILING:
+        err(
+            f"gate leg: {unviable} unviable mutants exceed the ceiling of "
+            f"{GATE_UNVIABLE_CEILING}; a config or code change stopped them "
+            "from building"
+        )
+        passed = False
+    elif unviable < GATE_UNVIABLE_CEILING:
+        print(
+            f"mutants-check: gate unviable {unviable} below ceiling "
+            f"{GATE_UNVIABLE_CEILING}; lower GATE_UNVIABLE_CEILING"
+        )
+    if caught < GATE_CAUGHT_FLOOR:
+        err(
+            f"gate leg: {caught} caught mutants below the floor of "
+            f"{GATE_CAUGHT_FLOOR}; a skip attribute, an exclude or a "
+            "cargo-mutants change dropped mutants from the gate"
+        )
+        passed = False
+    elif caught > GATE_CAUGHT_FLOOR:
+        print(
+            f"mutants-check: gate caught {caught} above floor "
+            f"{GATE_CAUGHT_FLOOR}; raise GATE_CAUGHT_FLOOR"
+        )
+    tested = caught + unviable
+    if tested < GATE_MUTANTS_FLOOR:
+        err(
+            f"gate leg: {tested} mutants tested below the floor of "
+            f"{GATE_MUTANTS_FLOOR}; a skip attribute, an exclude or a "
+            "cargo-mutants change dropped mutants from the gate"
+        )
+        passed = False
+    elif tested > GATE_MUTANTS_FLOOR:
+        print(
+            f"mutants-check: gate tested {tested} above floor "
+            f"{GATE_MUTANTS_FLOOR}; raise GATE_MUTANTS_FLOOR"
+        )
+    return passed
+
+
 def run_gate_leg() -> int:
     """Execute the gate leg and verify its outcome counts.
 
-    Removes ``.old`` output and checks the unviable ceiling and the caught
-    floor.
+    Removes ``.old`` output and checks the unviable ceiling, the caught floor,
+    and the tested population floor.
     """
     gate_rc = run_leg("gate", list(COMMON_ARGS), GATE_TIMEOUT_SECONDS)
     if GATE_OLD_OUTPUT.exists():
@@ -486,32 +616,7 @@ def run_gate_leg() -> int:
     caught = count_outcome_lines(GATE_OUTPUT, "caught.txt")
     if unviable is None or caught is None:
         return 1
-    failed = False
-    if unviable > GATE_UNVIABLE_CEILING:
-        err(
-            f"gate leg: {unviable} unviable mutants exceed the ceiling of "
-            f"{GATE_UNVIABLE_CEILING}; a config or code change stopped them "
-            "from building"
-        )
-        failed = True
-    elif unviable < GATE_UNVIABLE_CEILING:
-        print(
-            f"mutants-check: gate unviable {unviable} below ceiling "
-            f"{GATE_UNVIABLE_CEILING}; lower GATE_UNVIABLE_CEILING"
-        )
-    if caught < GATE_CAUGHT_FLOOR:
-        err(
-            f"gate leg: {caught} caught mutants below the floor of "
-            f"{GATE_CAUGHT_FLOOR}; a skip attribute, an exclude or a "
-            "cargo-mutants change dropped mutants from the gate"
-        )
-        failed = True
-    elif caught > GATE_CAUGHT_FLOOR:
-        print(
-            f"mutants-check: gate caught {caught} above floor "
-            f"{GATE_CAUGHT_FLOOR}; raise GATE_CAUGHT_FLOOR"
-        )
-    return 1 if failed else 0
+    return 0 if check_gate_counts(caught, unviable) else 1
 
 
 def main() -> int:
