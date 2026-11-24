@@ -28,6 +28,10 @@ COMMON_ARGS = ("-p", "kernel", "--no-shuffle", "--timeout", "120")
 GATE_OLD_OUTPUT = Path("mutants.out.old")
 GATE_TIMEOUT_SECONDS = 900
 PLANTED_TIMEOUT_SECONDS = 600
+# Grace period after SIGTERM for cargo-mutants to stop its child process groups.
+TERMINATE_GRACE_SECONDS = 60
+# Reap deadline after SIGKILL so a stuck process cannot block indefinitely.
+KILL_WAIT_SECONDS = 10
 EMPTY_OUTCOME_FILES = ("caught.txt", "timeout.txt", "unviable.txt")
 # cargo-mutants exit code when at least one mutant was missed.
 MISSED_EXIT_CODE = 2
@@ -144,25 +148,46 @@ def build_planted_args(config: MutantsConfig, output_dir: Path) -> list[str]:
     return args
 
 
-def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
-    """Run ``cargo mutants`` with ``args`` and an explicit timeout.
+def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
+    """Stop a timed-out ``cargo mutants`` process with SIGTERM, then SIGKILL.
 
-    The executable and subcommand are literals, so only arguments vary, and
-    each element of ``args`` reaches cargo as one argument without a shell.
+    ``cargo-mutants`` starts each cargo build and test child in its own process
+    group and stops those groups via ``killpg`` on ``SIGTERM``; ``SIGKILL``
+    skips that cleanup and leaves child process groups running.
+    """
+    proc.terminate()
+    try:
+        proc.wait(timeout=TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    else:
+        return
+    try:
+        proc.wait(timeout=KILL_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        err(f"{leg_name} leg did not exit after kill")
+
+
+def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
+    """Run ``cargo mutants`` with ``args`` and a bounded SIGTERM-then-kill deadline.
+
+    The executable and subcommand are literals at the call site, each element
+    of ``args`` is passed as one argv element without a shell, and a leg that
+    exceeds ``timeout_seconds`` is stopped with ``SIGTERM`` then ``SIGKILL``.
     """
     sys.stdout.flush()
     sys.stderr.flush()
     try:
-        completed = subprocess.run(
-            ["cargo", "mutants", *args], timeout=timeout_seconds, check=False
-        )
-    except subprocess.TimeoutExpired:
-        err(f"{leg_name} leg exceeded its {timeout_seconds}s deadline")
-        return None
+        proc = subprocess.Popen(["cargo", "mutants", *args])
     except OSError as exc:
         err(f"{leg_name} leg failed to start cargo-mutants: {exc}")
         return None
-    return completed.returncode
+    try:
+        return proc.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        err(f"{leg_name} leg exceeded its {timeout_seconds}s deadline")
+        stop_leg(leg_name, proc)
+        return None
 
 
 def read_outcome_file(mutants_out: Path, name: str) -> list[str] | None:
