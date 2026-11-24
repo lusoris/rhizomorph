@@ -37,8 +37,8 @@ PLANTED_TIMEOUT_SECONDS = 600
 TERMINATE_GRACE_SECONDS = 60
 # Reap deadline after SIGKILL so a stuck process cannot block indefinitely.
 KILL_WAIT_SECONDS = 10
-# Minimum whitespace-separated fields after ``)`` in /proc/<pid>/stat for pgrp.
-MIN_PROC_STAT_FIELDS = 3
+# Minimum whitespace-separated fields after ``)`` in /proc/<pid>/stat for session.
+MIN_PROC_STAT_FIELDS = 4
 EMPTY_OUTCOME_FILES = ("caught.txt", "timeout.txt", "unviable.txt")
 # cargo-mutants exit code when at least one mutant was missed.
 MISSED_EXIT_CODE = 2
@@ -158,9 +158,10 @@ def build_planted_args(config: MutantsConfig, output_dir: Path) -> list[str]:
     return args
 
 
-def read_proc_parent_pgid(entry: str) -> tuple[int, int] | None:
-    """Read ``(ppid, pgid)`` for numeric ``/proc`` ``entry``, or ``None``."""
-    # Linux only: /proc/<pid>/stat exists only on procfs platforms.
+def read_proc_pgid_session(entry: str) -> tuple[int, int] | None:
+    """Read ``(pgid, session)`` for numeric ``/proc`` ``entry``, or ``None``."""
+    # Linux only: /proc/<pid>/stat exists only on procfs platforms (proc(5)
+    # field 5 pgrp, field 6 session).
     if not (entry.isascii() and entry.isdigit()):
         return None
     try:
@@ -174,13 +175,13 @@ def read_proc_parent_pgid(entry: str) -> tuple[int, int] | None:
     if len(fields) < MIN_PROC_STAT_FIELDS:
         return None
     try:
-        return int(fields[1]), int(fields[2])
+        return int(fields[2]), int(fields[3])
     except ValueError:
         return None
 
 
-def child_process_groups(pid: int) -> list[int] | None:
-    """Return distinct child process group IDs of ``pid`` from ``/proc``.
+def session_process_groups(sid: int) -> list[int] | None:
+    """Return distinct process group IDs in session ``sid`` from ``/proc``.
 
     Linux only: returns ``None`` when ``/proc`` is not a directory because other
     platforms have no ``/proc``.
@@ -196,11 +197,11 @@ def child_process_groups(pid: int) -> list[int] | None:
     own_pgid = os.getpgrp()
     groups: list[int] = []
     for idx in range(len(entries)):
-        parsed = read_proc_parent_pgid(entries[idx])
+        parsed = read_proc_pgid_session(entries[idx])
         if parsed is None:
             continue
-        ppid, pgid = parsed
-        if ppid == pid and pgid > 1 and pgid != own_pgid and pgid not in groups:
+        pgid, session = parsed
+        if session == sid and pgid > 1 and pgid != own_pgid and pgid not in groups:
             groups.append(pgid)
     return groups
 
@@ -218,13 +219,14 @@ def kill_process_group(leg_name: str, pgid: int) -> None:
 
 
 def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
-    """Stop a timed-out ``cargo mutants`` process with SIGTERM, then SIGKILL.
+    """Stop a ``cargo mutants`` process with SIGTERM, then SIGKILL.
 
-    ``cargo-mutants`` starts each cargo build and test child in its own process
-    group and waits for those groups without a deadline on ``SIGTERM``. When
-    ``SIGTERM`` times out, direct child process groups are read from ``/proc``
-    before the ``SIGKILL`` to ``cargo-mutants`` and killed by group; without
-    ``/proc`` they may keep running.
+    ``cargo-mutants`` runs in its own session and starts each cargo build and
+    test child in its own process group, waiting for those groups without a
+    deadline on ``SIGTERM``. When ``SIGTERM`` times out, ``cargo-mutants`` is
+    killed with ``SIGKILL`` first and remaining process groups in its session,
+    including reparented descendants, are discovered from ``/proc`` and killed
+    by group; without ``/proc`` they may keep running.
     """
     proc.terminate()
     try:
@@ -233,21 +235,20 @@ def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
         pass
     else:
         return
-    groups = child_process_groups(proc.pid)
+    proc.kill()
+    groups = session_process_groups(proc.pid)
     if groups is None:
         err(
             f"{leg_name} leg ignored SIGTERM for {TERMINATE_GRACE_SECONDS}s; "
             "killing cargo-mutants, its build and test process groups may keep "
             "running"
         )
-        proc.kill()
     else:
         err(
             f"{leg_name} leg ignored SIGTERM for {TERMINATE_GRACE_SECONDS}s; "
-            f"killing cargo-mutants and {len(groups)} build and test process "
-            "groups"
+            f"killing cargo-mutants and {len(groups)} process groups in its "
+            "session"
         )
-        proc.kill()
         for idx in range(len(groups)):
             kill_process_group(leg_name, groups[idx])
     try:
@@ -260,18 +261,23 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
     """Run ``cargo mutants`` with ``args`` and a bounded SIGTERM-then-kill deadline.
 
     The executable and subcommand are literals at the call site, each element
-    of ``args`` is passed as one argv element without a shell, and a leg that
-    exceeds ``timeout_seconds`` is stopped with ``SIGTERM`` then ``SIGKILL``.
+    of ``args`` is passed as one argv element without a shell, and the leg runs
+    in a session of its own so every descendant can be found. Exceeding
+    ``timeout_seconds`` stops the leg with ``SIGTERM`` then ``SIGKILL``, and
+    Ctrl-C or ``SIGTERM`` to the script stops the leg the same way.
     """
     sys.stdout.flush()
     sys.stderr.flush()
     try:
-        proc = subprocess.Popen(["cargo", "mutants", *args])
+        proc = subprocess.Popen(["cargo", "mutants", *args], start_new_session=True)
     except OSError as exc:
         err(f"{leg_name} leg failed to start cargo-mutants: {exc}")
         return None
     try:
         return proc.wait(timeout=timeout_seconds)
+    except KeyboardInterrupt:
+        stop_leg(leg_name, proc)
+        raise
     except subprocess.TimeoutExpired:
         err(f"{leg_name} leg exceeded its {timeout_seconds}s deadline")
         stop_leg(leg_name, proc)
@@ -419,6 +425,8 @@ def run_gate_leg() -> int:
 
 def main() -> int:
     """Run configuration validation, the gate leg, and the planted leg."""
+    # Raise KeyboardInterrupt on SIGTERM so run_leg stops the active leg session.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     config, status = load_config(CONFIG_PATH)
     if config is None:
         return status
