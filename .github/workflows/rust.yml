@@ -5,7 +5,7 @@
 # Rust workspace gate: runs workspace unit and integration tests, the
 # thumbv7em-none-eabihf no_std build of kernel, clippy lints, rustfmt check,
 # cargo-deny dependency licence verification (with planted negative check),
-# and cargo-mutants kernel mutation testing.
+# and cargo-mutants kernel mutation testing (with planted negative check).
 name: Rust
 
 'on':
@@ -173,6 +173,9 @@ jobs:
 
   mutants:
     name: mutants
+    # Linux only: kernel is no_std and holds no cfg(target_os), cfg(windows),
+    # cfg(unix), or cfg(target_family), so which mutants the tests catch does
+    # not depend on the host OS.
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
@@ -200,6 +203,6 @@ jobs:
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5
         with:
           tool: cargo-mutants@27.1.0
-      - name: Run kernel mutation tests
+      - name: Run kernel mutation tests and replay the excluded mutants
         if: github.event.pull_request.draft != true
-        run: cargo mutants -p kernel --no-shuffle --timeout 120
+        run: python3 scripts/mutants-check.py
