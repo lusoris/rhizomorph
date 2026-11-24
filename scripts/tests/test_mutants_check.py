@@ -405,7 +405,11 @@ class ConfigAndArgvTests(unittest.TestCase):
             out_idx = leg_args.index("--output")
             out_dir = Path(leg_args[out_idx + 1])
             self.assertTrue(out_dir.is_dir())
-            self.assertFalse(out_dir.resolve().is_relative_to(cwd_resolved))
+            out_resolved = out_dir.resolve()
+            self.assertEqual(out_resolved.parent, Path(tempfile.gettempdir()).resolve())
+            self.assertTrue(out_dir.name.startswith("mutants-gate-"))
+            self.assertNotEqual(out_resolved, (cwd_resolved / "mutants.out").resolve())
+            self.assertNotEqual(out_resolved, cwd_resolved)
             seen_dirs.append(out_dir)
             if leg_rc == 0:
                 write_mutants_out(
@@ -424,24 +428,66 @@ class ConfigAndArgvTests(unittest.TestCase):
         return rc, err_txt, seen_dirs[0]
 
     def test_gate_leg_uses_private_output_dir(self) -> None:
-        """Verify ``run_gate_leg`` reads counts from a temporary dir outside cwd."""
+        """Read counts from a private temporary directory, a new one per run."""
         floor = MOD.GATE_CAUGHT_FLOOR
         pass_unviable = MOD.GATE_UNVIABLE_CEILING
         pass_caught = max(floor, MOD.GATE_MUTANTS_FLOOR - pass_unviable)
+        dirs: list[Path] = []
 
-        rc, err_txt, _ = self._invoke_gate_leg_capturing_dir(pass_caught, pass_unviable)
+        rc, err_txt, out_dir = self._invoke_gate_leg_capturing_dir(
+            pass_caught, pass_unviable
+        )
         self.assertEqual(rc, 0)
         self.assertEqual(err_txt, "")
+        dirs.append(out_dir)
 
-        rc, err_txt, _ = self._invoke_gate_leg_capturing_dir(floor - 1, pass_unviable)
+        rc, err_txt, out_dir = self._invoke_gate_leg_capturing_dir(
+            floor - 1, pass_unviable
+        )
         self.assertEqual(rc, 1)
         self.assertIn("caught mutants below the floor", err_txt)
+        dirs.append(out_dir)
 
-        rc, err_txt, _ = self._invoke_gate_leg_capturing_dir(
+        rc, err_txt, out_dir = self._invoke_gate_leg_capturing_dir(
             pass_caught, pass_unviable, leg_rc=1
         )
         self.assertEqual(rc, 1)
         self.assertIn("gate leg failed", err_txt)
+        dirs.append(out_dir)
+
+        self.assertEqual(len(set(dirs)), 3)
+
+    def test_gate_leg_private_dir_follows_tmpdir_inside_cwd(self) -> None:
+        """Accept a ``tempfile`` directory inside cwd and still enforce gate counts."""
+        floor = MOD.GATE_CAUGHT_FLOOR
+        pass_unviable = MOD.GATE_UNVIABLE_CEILING
+        pass_caught = max(floor, MOD.GATE_MUTANTS_FLOOR - pass_unviable)
+        prev_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as raw_cwd:
+            checkout = Path(raw_cwd).resolve()
+            inside = checkout / "tmp-inside"
+            inside.mkdir()
+            inside_resolved = inside.resolve()
+            os.chdir(checkout)
+            try:
+                with mock.patch.object(tempfile, "tempdir", str(inside)):
+                    rc, err_txt, pass_dir = self._invoke_gate_leg_capturing_dir(
+                        pass_caught, pass_unviable
+                    )
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(err_txt, "")
+                    self.assertEqual(pass_dir.resolve().parent, inside_resolved)
+                    self.assertFalse(pass_dir.exists())
+
+                    rc, err_txt, fail_dir = self._invoke_gate_leg_capturing_dir(
+                        floor - 1, pass_unviable
+                    )
+                    self.assertEqual(rc, 1)
+                    self.assertIn("caught mutants below the floor", err_txt)
+                    self.assertEqual(fail_dir.resolve().parent, inside_resolved)
+                    self.assertFalse(fail_dir.exists())
+            finally:
+                os.chdir(prev_cwd)
 
     def test_gate_leg_ignores_stale_cwd_mutants_out(self) -> None:
         """Ignore a passing ``./mutants.out`` in cwd when private counts fail."""

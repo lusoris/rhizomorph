@@ -871,9 +871,10 @@ def check_gate_counts(caught: int, unviable: int) -> bool:
 def run_gate_leg() -> int:
     """Execute the gate leg and verify its outcome counts.
 
-    Writes ``cargo-mutants`` output to a private temporary directory outside
-    the checkout and checks the unviable ceiling, the caught floor, and the
-    tested population floor before removing it.
+    Writes ``cargo-mutants`` output to a new private ``tempfile`` directory
+    (under ``TMPDIR``, outside the checkout unless ``TMPDIR`` points into it)
+    and checks the unviable ceiling, the caught floor, and the tested
+    population floor before removing it.
     """
     with tempfile.TemporaryDirectory(prefix="mutants-gate-") as tmp_dir:
         output_dir = Path(tmp_dir)
