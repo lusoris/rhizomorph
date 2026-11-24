@@ -17,6 +17,7 @@ import importlib.util
 import io
 import os
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -390,21 +391,95 @@ class ConfigAndArgvTests(unittest.TestCase):
             },
         )
 
-    def test_gate_leg_passes_explicit_output_dot(self) -> None:
-        """Verify ``run_gate_leg`` passes ``--output .`` to ``run_leg``."""
-        with (
-            mock.patch.object(MOD, "run_leg", return_value=1) as mock_run_leg,
-            mock.patch.object(Path, "exists", return_value=False),
-        ):
+    def _invoke_gate_leg_capturing_dir(
+        self, caught: int, unviable: int, leg_rc: int = 0
+    ) -> tuple[int, str, Path]:
+        """Run ``run_gate_leg`` with ``run_leg`` stubbed to populate ``--output``."""
+        seen_dirs: list[Path] = []
+        cwd_resolved = Path.cwd().resolve()
+
+        def fake_run_leg(leg_name: str, leg_args: list[str], leg_timeout: int) -> int:
+            """Validate private ``--output`` directory and write fixture counts."""
+            self.assertEqual(leg_name, "gate")
+            self.assertEqual(leg_timeout, MOD.GATE_TIMEOUT_SECONDS)
+            out_idx = leg_args.index("--output")
+            out_dir = Path(leg_args[out_idx + 1])
+            self.assertTrue(out_dir.is_dir())
+            self.assertFalse(out_dir.resolve().is_relative_to(cwd_resolved))
+            seen_dirs.append(out_dir)
+            if leg_rc == 0:
+                write_mutants_out(
+                    out_dir,
+                    {
+                        "caught.txt": "caught\n" * caught,
+                        "unviable.txt": "unviable\n" * unviable,
+                    },
+                )
+            return leg_rc
+
+        with mock.patch.object(MOD, "run_leg", side_effect=fake_run_leg):
             rc, _, err_txt = call_quiet(MOD.run_gate_leg)
+        self.assertEqual(len(seen_dirs), 1)
+        self.assertFalse(seen_dirs[0].exists())
+        return rc, err_txt, seen_dirs[0]
+
+    def test_gate_leg_uses_private_output_dir(self) -> None:
+        """Verify ``run_gate_leg`` reads counts from a temporary dir outside cwd."""
+        floor = MOD.GATE_CAUGHT_FLOOR
+        pass_unviable = MOD.GATE_UNVIABLE_CEILING
+        pass_caught = max(floor, MOD.GATE_MUTANTS_FLOOR - pass_unviable)
+
+        rc, err_txt, _ = self._invoke_gate_leg_capturing_dir(pass_caught, pass_unviable)
+        self.assertEqual(rc, 0)
+        self.assertEqual(err_txt, "")
+
+        rc, err_txt, _ = self._invoke_gate_leg_capturing_dir(floor - 1, pass_unviable)
+        self.assertEqual(rc, 1)
+        self.assertIn("caught mutants below the floor", err_txt)
+
+        rc, err_txt, _ = self._invoke_gate_leg_capturing_dir(
+            pass_caught, pass_unviable, leg_rc=1
+        )
         self.assertEqual(rc, 1)
         self.assertIn("gate leg failed", err_txt)
-        mock_run_leg.assert_called_once()
-        leg_name, leg_args, leg_timeout = mock_run_leg.call_args.args
-        self.assertEqual(leg_name, "gate")
-        self.assertEqual(leg_timeout, MOD.GATE_TIMEOUT_SECONDS)
-        out_idx = leg_args.index("--output")
-        self.assertEqual(leg_args[out_idx : out_idx + 2], ["--output", "."])
+
+    def test_gate_leg_ignores_stale_cwd_mutants_out(self) -> None:
+        """Ignore a passing ``./mutants.out`` in cwd when private counts fail."""
+        floor = MOD.GATE_CAUGHT_FLOOR
+        pass_unviable = MOD.GATE_UNVIABLE_CEILING
+        pass_caught = max(floor, MOD.GATE_MUTANTS_FLOOR - pass_unviable)
+        prev_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as raw_cwd:
+            cwd_dir = Path(raw_cwd).resolve()
+            write_mutants_out(
+                cwd_dir,
+                {
+                    "caught.txt": "caught\n" * pass_caught,
+                    "unviable.txt": "unviable\n" * pass_unviable,
+                },
+            )
+            os.chdir(cwd_dir)
+            try:
+
+                def fake_run_leg(_name: str, leg_args: list[str], _timeout: int) -> int:
+                    """Write failing counts only when ``--output`` is outside cwd."""
+                    out_dir = Path(leg_args[leg_args.index("--output") + 1])
+                    if not out_dir.resolve().is_relative_to(cwd_dir):
+                        write_mutants_out(
+                            out_dir,
+                            {
+                                "caught.txt": "caught\n" * (floor - 1),
+                                "unviable.txt": "unviable\n" * pass_unviable,
+                            },
+                        )
+                    return 0
+
+                with mock.patch.object(MOD, "run_leg", side_effect=fake_run_leg):
+                    rc, _, err_txt = call_quiet(MOD.run_gate_leg)
+            finally:
+                os.chdir(prev_cwd)
+        self.assertEqual(rc, 1)
+        self.assertIn("caught mutants below the floor", err_txt)
 
     def test_run_leg_passes_sanitized_env_to_popen(self) -> None:
         """Verify ``run_leg`` strips ``CARGO_MUTANTS_OUTPUT`` from ``Popen`` ``env``."""
@@ -844,6 +919,46 @@ class SubreaperAndOrphanTests(unittest.TestCase):
         self.assertEqual(events, ["wait", "orphans"])
         self.assertIn("descendants", err_txt)
 
+    def test_stop_leg_waits_and_reaps_when_post_kill_probe_misses(self) -> None:
+        """Continue to ``proc.wait`` and ``reap_orphans`` after a missed kill probe."""
+        events: list[str] = []
+        fake_proc = mock.MagicMock()
+        fake_proc.pid = 702
+
+        def rec_wait(*_args: object, **_kwargs: object) -> int:
+            """Record ``proc.wait`` in ``events``."""
+            events.append("wait")
+            return 0
+
+        def rec_orphans(_leg: str) -> bool:
+            """Record ``reap_orphans`` in ``events`` and return ``True``."""
+            events.append("orphans")
+            return True
+
+        fake_proc.wait.side_effect = rec_wait
+        with (
+            mock.patch.object(MOD, "signal_leg"),
+            mock.patch.object(MOD, "wait_exited", return_value=False),
+            mock.patch.object(MOD, "kill_session_leftovers", return_value=True),
+            mock.patch.object(MOD, "reap_orphans", side_effect=rec_orphans),
+        ):
+            _, _, err_txt = call_quiet(MOD.stop_leg, "gate", fake_proc)
+        self.assertEqual(events, ["wait", "orphans"])
+        self.assertIn("did not exit after kill", err_txt)
+        self.assertNotIn("not reaped", err_txt)
+
+        fake_proc.wait.side_effect = subprocess.TimeoutExpired(["cargo"], 1)
+        with (
+            mock.patch.object(MOD, "signal_leg"),
+            mock.patch.object(MOD, "wait_exited", return_value=False),
+            mock.patch.object(MOD, "kill_session_leftovers", return_value=True),
+            mock.patch.object(MOD, "reap_orphans") as mock_orphans,
+        ):
+            _, _, err_txt = call_quiet(MOD.stop_leg, "gate", fake_proc)
+        mock_orphans.assert_not_called()
+        self.assertIn("did not exit after kill", err_txt)
+        self.assertIn("not reaped after kill", err_txt)
+
 
 class CancellationTests(unittest.TestCase):
     """Replay ``cancel_status``, ``run_leg``, and ``main`` cancellation handling."""
@@ -944,6 +1059,56 @@ class CancellationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
+    sys.platform.startswith("linux")
+    and hasattr(os, "pidfd_open")
+    and hasattr(os, "P_PIDFD"),
+    "requires Linux pidfd waitid support",
+)
+class LeftoverPidCleanupTests(unittest.TestCase):
+    """Replay live-child, non-child, and zombie cases for ``_kill_leftover_pid``."""
+
+    def test_kills_live_child(self) -> None:
+        """Kill a live child process and reap its ``SIGKILL`` exit status."""
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            RealDescendantCleanupTests._kill_leftover_pid(proc.pid)
+            rc = proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                MOD.signal_leg(proc, signal.SIGKILL)
+                proc.wait(timeout=5)
+        self.assertEqual(rc, -int(signal.SIGKILL))
+
+    def test_skips_non_child_parent_pid(self) -> None:
+        """Refuse to signal ``os.getppid()`` when ``waitid`` rejects ownership."""
+        parent_pid = os.getppid()
+        self.assertGreater(parent_pid, 1)
+        with mock.patch.object(signal, "pidfd_send_signal", create=True) as mock_send:
+            RealDescendantCleanupTests._kill_leftover_pid(parent_pid)
+        mock_send.assert_not_called()
+
+    def test_skips_exited_unreaped_child_without_reaping(self) -> None:
+        """Leave an exited zombie child unsignalled and still waitable."""
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            MOD.signal_leg(proc, signal.SIGKILL)
+            self.assertTrue(MOD.wait_exited(proc.pid, 5.0))
+            with mock.patch.object(
+                signal, "pidfd_send_signal", create=True
+            ) as mock_send:
+                RealDescendantCleanupTests._kill_leftover_pid(proc.pid)
+            mock_send.assert_not_called()
+            probe = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            self.assertIsNotNone(probe)
+            rc = proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                MOD.signal_leg(proc, signal.SIGKILL)
+                proc.wait(timeout=5)
+        self.assertEqual(rc, -int(signal.SIGKILL))
+
+
+@unittest.skipUnless(
     sys.platform.startswith("linux") and hasattr(os, "pidfd_open"),
     "requires Linux pidfd support",
 )
@@ -953,7 +1118,7 @@ class RealDescendantCleanupTests(unittest.TestCase):
     def setUp(self) -> None:
         """Create temporary stub/FIFO fixtures and enable child subreaper."""
         MOD.CANCEL_SIGNALS.clear()
-        self.tmp_dir = tempfile.TemporaryDirectory(prefix="mutants-descendant-")
+        self.tmp_dir = tempfile.TemporaryDirectory(prefix="mutants descendant $USER '-")
         self.base = Path(self.tmp_dir.name)
         self.fifo_path = self.base / "grandchild.fifo"
         self.ready_path = self.base / "ready.fifo"
@@ -986,23 +1151,32 @@ class RealDescendantCleanupTests(unittest.TestCase):
                 break
         self.tmp_dir.cleanup()
 
-    def _kill_leftover_pid(self, pid: int) -> None:
-        """Send ``SIGKILL`` to ``pid`` above ``1`` via pidfd when still present."""
+    @staticmethod
+    def _kill_leftover_pid(pid: int) -> None:
+        """Pin identity via pidfd and prove ownership with waitid before SIGKILL."""
         if pid <= 1:
             return
         try:
             fd = os.pidfd_open(pid)
-        except (FileNotFoundError, ProcessLookupError, OSError):
+        except OSError:
             return
         try:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            try:
+                exited = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except OSError:
+                return
+            if exited is None:
+                with contextlib.suppress(OSError):
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
         finally:
             with contextlib.suppress(OSError):
                 os.close(fd)
 
     def _write_cargo_stub(self, launcher_prefix: str, tail_cmd: str) -> None:
         """Write an executable ``cargo`` shell stub spawning a FIFO-holding child."""
+        quoted_pid = shlex.quote(str(self.pid_file))
+        quoted_fifo = shlex.quote(str(self.fifo_path))
+        quoted_ready = shlex.quote(str(self.ready_path))
         script = (
             "#!/bin/sh\n"
             f"{launcher_prefix} sh -c '\n"
@@ -1011,9 +1185,9 @@ class RealDescendantCleanupTests(unittest.TestCase):
             '  printf "x" >&3\n'
             '  printf "r\\n" > "$3"\n'
             "  exec sleep 60\n"
-            f'\' sh "{self.pid_file}" "{self.fifo_path}" "{self.ready_path}" '
+            f"' sh {quoted_pid} {quoted_fifo} {quoted_ready} "
             "</dev/null >/dev/null 2>&1 &\n"
-            f'read -r _ < "{self.ready_path}"\n'
+            f"read -r _ < {quoted_ready}\n"
             f"{tail_cmd}\n"
         )
         self.stub_path.write_text(script, encoding="utf-8")

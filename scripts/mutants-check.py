@@ -20,7 +20,6 @@ import ctypes
 import os
 import re
 import select
-import shutil
 import signal
 import subprocess
 import sys
@@ -42,11 +41,11 @@ ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
 # count.
 COMMON_ARGS = ("-p", "kernel", "--jobs", "1", "--no-shuffle", "--timeout", "120")
 CARGO_MUTANTS_ENV_PREFIX = "CARGO_MUTANTS_"
-GATE_OUTPUT = Path("mutants.out")
-GATE_OLD_OUTPUT = Path("mutants.out.old")
-# Leg + stop time must fit mutants job timeout-minutes in .github/workflows/rust.yml;
-# cleanup adds at most 2 * CLEANUP_ROUNDS * CLEANUP_ROUND_WAIT_SECONDS = 2 s per leg
-# end (session pass, then orphan reap), inside the step timeout headroom.
+# Leg + stop time must fit mutants job timeout-minutes in .github/workflows/rust.yml:
+# stop takes at most TERMINATE_GRACE_SECONDS + 2 * KILL_WAIT_SECONDS = 80 s (grace
+# plus up to two kill waits), and cleanup adds at most
+# 2 * CLEANUP_ROUNDS * CLEANUP_ROUND_WAIT_SECONDS = 2 s per leg end (session pass,
+# then orphan reap), for 82 s per leg end and 900 + 600 + 2 * 82 = 1664 s total.
 GATE_TIMEOUT_SECONDS = 900
 PLANTED_TIMEOUT_SECONDS = 600
 # Grace period after SIGTERM for cargo-mutants to stop its child process groups.
@@ -626,11 +625,10 @@ def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
     kill_session_leftovers(leg_name, proc.pid, reason)
     if not exited:
         err(f"{leg_name} leg did not exit after kill")
-        return
     try:
         proc.wait(timeout=KILL_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
-        err(f"{leg_name} leg did not exit after kill")
+        err(f"{leg_name} leg was not reaped after kill")
         return
     if not reap_orphans(leg_name):
         err(f"{leg_name} leg stop could not verify that all descendants exited")
@@ -873,26 +871,26 @@ def check_gate_counts(caught: int, unviable: int) -> bool:
 def run_gate_leg() -> int:
     """Execute the gate leg and verify its outcome counts.
 
-    Removes ``.old`` output and checks the unviable ceiling, the caught floor,
-    and the tested population floor.
+    Writes ``cargo-mutants`` output to a private temporary directory outside
+    the checkout and checks the unviable ceiling, the caught floor, and the
+    tested population floor before removing it.
     """
-    gate_rc = run_leg("gate", [*COMMON_ARGS, "--output", "."], GATE_TIMEOUT_SECONDS)
-    if GATE_OLD_OUTPUT.exists():
-        try:
-            shutil.rmtree(GATE_OLD_OUTPUT)
-        except OSError as exc:
-            err(f"failed to remove {GATE_OLD_OUTPUT}: {exc}")
+    with tempfile.TemporaryDirectory(prefix="mutants-gate-") as tmp_dir:
+        output_dir = Path(tmp_dir)
+        gate_rc = run_leg(
+            "gate", [*COMMON_ARGS, "--output", str(output_dir)], GATE_TIMEOUT_SECONDS
+        )
+        if gate_rc is None:
             return 1
-    if gate_rc is None:
-        return 1
-    if gate_rc != 0:
-        err(f"gate leg failed (cargo-mutants exit {gate_rc})")
-        return 1
-    unviable = count_outcome_lines(GATE_OUTPUT, "unviable.txt")
-    caught = count_outcome_lines(GATE_OUTPUT, "caught.txt")
-    if unviable is None or caught is None:
-        return 1
-    return 0 if check_gate_counts(caught, unviable) else 1
+        if gate_rc != 0:
+            err(f"gate leg failed (cargo-mutants exit {gate_rc})")
+            return 1
+        mutants_out = output_dir / "mutants.out"
+        unviable = count_outcome_lines(mutants_out, "unviable.txt")
+        caught = count_outcome_lines(mutants_out, "caught.txt")
+        if unviable is None or caught is None:
+            return 1
+        return 0 if check_gate_counts(caught, unviable) else 1
 
 
 def main() -> int:
