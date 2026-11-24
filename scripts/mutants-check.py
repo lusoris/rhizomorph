@@ -9,14 +9,17 @@ that the number of mutants that fail to build stays at or below a recorded
 ceiling. The planted leg replays only the ``exclude_re`` patterns with
 ``--no-config`` and proves both that the gate fails when a mutant survives and
 that every exclusion still names exactly one surviving equivalent mutant. Linux
-only: the cleanup reads ``/proc`` and kills through pidfds, and a leg whose
-cleanup cannot be verified fails.
+only: the runner marks itself a child subreaper, strips ``CARGO_MUTANTS_*``
+environment overrides, kills session and reparented leftovers through pidfds,
+and fails closed unless ``waitpid(-1, WNOHANG)`` proves ``ECHILD``.
 """
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -24,6 +27,7 @@ import sys
 import tempfile
 import time
 import tomllib
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
@@ -37,11 +41,12 @@ ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
 # unchanged, while the ``cargo-mutants`` jobserver caps compile tasks at the CPU
 # count.
 COMMON_ARGS = ("-p", "kernel", "--jobs", "1", "--no-shuffle", "--timeout", "120")
+CARGO_MUTANTS_ENV_PREFIX = "CARGO_MUTANTS_"
 GATE_OUTPUT = Path("mutants.out")
 GATE_OLD_OUTPUT = Path("mutants.out.old")
 # Leg + stop time must fit mutants job timeout-minutes in .github/workflows/rust.yml;
-# cleanup adds at most CLEANUP_ROUNDS * CLEANUP_ROUND_WAIT_SECONDS = 1 s per leg end,
-# inside the step timeout headroom.
+# cleanup adds at most 2 * CLEANUP_ROUNDS * CLEANUP_ROUND_WAIT_SECONDS = 2 s per leg
+# end (session pass, then orphan reap), inside the step timeout headroom.
 GATE_TIMEOUT_SECONDS = 900
 PLANTED_TIMEOUT_SECONDS = 600
 # Grace period after SIGTERM for cargo-mutants to stop its child process groups.
@@ -57,9 +62,17 @@ EXIT_POLL_SECONDS = 0.05
 CLEANUP_ROUNDS = 5
 # Wait between /proc scan-and-kill rounds so killed processes can exit.
 CLEANUP_ROUND_WAIT_SECONDS = 0.2
+# Linux prctl(2) option value from /usr/include/linux/prctl.h.
+PR_SET_CHILD_SUBREAPER = 36
+# Upper bound on exited children reaped per round before re-scanning /proc.
+REAP_DRAIN_LIMIT = 256
+DRAIN_EMPTY = "empty"
+DRAIN_LIVE = "live"
+DRAIN_FAILED = "failed"
 # First SIGINT or SIGTERM the script received; set only by request_cancel.
 CANCEL_SIGNALS: list[int] = []
-# Minimum whitespace-separated fields after ``)`` in /proc/<pid>/stat for session.
+# Minimum whitespace-separated fields after ``)`` in /proc/<pid>/stat for
+# state, ppid, and session.
 MIN_PROC_STAT_FIELDS = 4
 PROC_STAT_PARSED = "parsed"
 PROC_STAT_VANISHED = "vanished"
@@ -102,7 +115,7 @@ class ProcStatRead:
     """Outcome of reading ``/proc/<pid>/stat`` for one process entry."""
 
     status: str
-    parsed: tuple[str, int] | None = None
+    parsed: tuple[str, int, int] | None = None
     error: str | None = None
 
 
@@ -127,6 +140,41 @@ def cancel_status() -> int | None:
     signum = CANCEL_SIGNALS[0]
     err(f"cancelled by {signal.Signals(signum).name}")
     return SIGNAL_EXIT_BASE + signum
+
+
+def enable_subreaper() -> bool:
+    """Mark the current process as a Linux child subreaper via ``prctl``."""
+    # Linux only: orphaned descendants reparent to this process so waitpid(-1)
+    # can wait on them (PR_SET_CHILD_SUBREAPER(2const)).
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+    except (OSError, AttributeError) as exc:
+        err(f"failed to load libc prctl for child subreaper: {exc}")
+        return False
+    prctl.restype = ctypes.c_int
+    rc = prctl(
+        ctypes.c_int(PR_SET_CHILD_SUBREAPER),
+        ctypes.c_ulong(1),
+        ctypes.c_ulong(0),
+        ctypes.c_ulong(0),
+        ctypes.c_ulong(0),
+    )
+    if rc != 0:
+        err(f"failed to enable child subreaper: {os.strerror(ctypes.get_errno())}")
+        return False
+    return True
+
+
+def leg_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    """Return a copy of ``environ`` without ``CARGO_MUTANTS_*`` overrides."""
+    keys = list(environ.keys())
+    cleaned: dict[str, str] = {}
+    for idx in range(len(keys)):
+        key = keys[idx]
+        if not key.startswith(CARGO_MUTANTS_ENV_PREFIX):
+            cleaned[key] = environ[key]
+    return cleaned
 
 
 def parse_string_list(raw: object, key: str, path: Path) -> list[str] | None:
@@ -263,8 +311,8 @@ def signal_leg(proc: subprocess.Popen[bytes], sig: int) -> None:
             return
 
 
-def parse_proc_stat(text: str) -> tuple[str, int] | None:
-    """Parse ``(state, session)`` from ``/proc/<pid>/stat`` content ``text``."""
+def parse_proc_stat(text: str) -> tuple[str, int, int] | None:
+    """Parse ``(state, ppid, session)`` from ``/proc/<pid>/stat`` content ``text``."""
     rparen = text.rfind(")")
     if rparen < 0:
         return None
@@ -272,21 +320,21 @@ def parse_proc_stat(text: str) -> tuple[str, int] | None:
     if len(fields) < MIN_PROC_STAT_FIELDS:
         return None
     try:
-        return fields[0], int(fields[3])
+        return fields[0], int(fields[1]), int(fields[3])
     except ValueError:
         return None
 
 
 def read_proc_state_session(entry: str) -> ProcStatRead:
-    """Read ``(state, session)`` for numeric ``/proc`` ``entry``.
+    """Read ``(state, ppid, session)`` for numeric ``/proc`` ``entry``.
 
-    Returns ``PROC_STAT_PARSED`` with ``(state, session)``,
+    Returns ``PROC_STAT_PARSED`` with ``(state, ppid, session)``,
     ``PROC_STAT_VANISHED`` when ``entry`` is non-numeric or exited before the
     read, and ``PROC_STAT_FAILED`` with a reason when ``stat`` could not be read
     or parsed.
     """
     # Linux only: /proc/<pid>/stat exists only on procfs platforms (proc(5)
-    # field 3 state, field 6 session).
+    # field 3 state, field 4 ppid, field 6 session).
     if not (entry.isascii() and entry.isdigit()):
         return ProcStatRead(PROC_STAT_VANISHED)
     stat_path = Path(f"/proc/{entry}/stat")
@@ -302,14 +350,64 @@ def read_proc_state_session(entry: str) -> ProcStatRead:
     return ProcStatRead(PROC_STAT_PARSED, parsed=parsed)
 
 
-def session_live_pids(sid: int) -> list[int] | None:
-    """Return live descendant PIDs in session ``sid`` from ``/proc``.
+def zombie_group_exited(pid: int) -> bool | None:
+    """Check via pidfd poll whether every thread in zombie ``pid`` has exited.
 
-    Linux only: returns ``None`` when ``/proc`` is not a directory, cannot be
-    listed, or has an unreadable or unparseable numeric ``stat`` entry. Excludes
-    zombies, dead processes, the held session leader ``sid``, and the current
-    process.
+    Returns ``True`` when the thread group exited or vanished, ``False`` when
+    live threads remain, and ``None`` when pidfd inspection fails.
     """
+    # Without PIDFD_THREAD, the file descriptor becomes readable only when the
+    # last thread in the thread group exits (pidfd_open(2), NOTES).
+    try:
+        fd = os.pidfd_open(pid)
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    except OSError as exc:
+        err(f"failed to open pidfd for {pid}: {exc}")
+        return None
+    exited: bool | None = None
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        events = poller.poll(0)
+        exited = False
+        for idx in range(len(events)):
+            if events[idx][1] & select.POLLIN:
+                exited = True
+    except OSError as exc:
+        err(f"failed to poll pidfd for {pid}: {exc}")
+        exited = None
+    finally:
+        try:
+            os.close(fd)
+        except OSError as exc:
+            err(f"failed to close pidfd for {pid}: {exc}")
+            exited = None
+    return exited
+
+
+def session_entry_live(
+    pid: int,
+    parsed: tuple[str, int, int],
+    sid: int,
+    own_pid: int,
+) -> bool | None:
+    """Return whether ``pid`` is a live targetable member of session ``sid``."""
+    state, _, session = parsed
+    if session != sid or pid in (sid, own_pid) or state == "X":
+        return False
+    if state == "Z":
+        exited = zombie_group_exited(pid)
+        if exited is None:
+            return None
+        return not exited
+    return True
+
+
+def scan_proc_pids(
+    include: Callable[[int, tuple[str, int, int]], bool | None],
+) -> list[int] | None:
+    """Return numeric ``/proc`` PIDs selected by ``include``, or ``None`` on error."""
     # Linux only: other platforms have no /proc directory.
     try:
         if not Path("/proc").is_dir():
@@ -318,7 +416,6 @@ def session_live_pids(sid: int) -> list[int] | None:
     except OSError as exc:
         err(f"failed to list /proc: {exc}")
         return None
-    own_pid = os.getpid()
     pids: list[int] = []
     for idx in range(len(entries)):
         entry = entries[idx]
@@ -330,11 +427,36 @@ def session_live_pids(sid: int) -> list[int] | None:
             return None
         if result.parsed is None:
             continue
-        state, session = result.parsed
         pid = int(entry)
-        if session == sid and state not in ("Z", "X") and pid not in (sid, own_pid):
+        keep = include(pid, result.parsed)
+        if keep is None:
+            return None
+        if keep:
             pids.append(pid)
     return pids
+
+
+def session_live_pids(sid: int) -> list[int] | None:
+    """Return live descendant PIDs in session ``sid`` from ``/proc``.
+
+    Linux only: returns ``None`` when ``/proc`` is not a directory, cannot be
+    listed, or has an unreadable or unparseable numeric ``stat`` entry. Excludes
+    exited zombie thread groups, dead processes, the held session leader
+    ``sid``, and the current process.
+    """
+    own_pid = os.getpid()
+    return scan_proc_pids(
+        lambda pid, parsed: session_entry_live(pid, parsed, sid, own_pid)
+    )
+
+
+def reparented_children_pids(subreaper_pid: int) -> list[int] | None:
+    """Return non-dead PIDs in ``/proc`` whose ``ppid`` is ``subreaper_pid``."""
+    return scan_proc_pids(
+        lambda pid, parsed: (
+            parsed[1] == subreaper_pid and parsed[0] != "X" and pid != subreaper_pid
+        )
+    )
 
 
 def send_pidfd_kill(leg_name: str, fd: int, pid: int) -> bool:
@@ -349,8 +471,12 @@ def send_pidfd_kill(leg_name: str, fd: int, pid: int) -> bool:
     return True
 
 
-def kill_verified(leg_name: str, pid: int, sid: int) -> bool:
-    """Kill ``pid`` via a pidfd after re-checking that it belongs to session ``sid``.
+def kill_pidfd_matching(
+    leg_name: str,
+    pid: int,
+    matches: Callable[[tuple[str, int, int]], bool],
+) -> bool:
+    """Kill ``pid`` via a pidfd when its re-read ``stat`` satisfies ``matches``.
 
     The pidfd pins the process found at open time, so a signal sent through it
     can never reach a process that took ``pid`` later.
@@ -370,7 +496,7 @@ def kill_verified(leg_name: str, pid: int, sid: int) -> bool:
         if result.status == PROC_STAT_FAILED:
             err(f"{leg_name} leg failed to verify {pid}: {result.error}")
             verified = False
-        elif result.parsed is not None and result.parsed[1] == sid:
+        elif result.parsed is not None and matches(result.parsed):
             verified = send_pidfd_kill(leg_name, fd, pid)
     finally:
         try:
@@ -379,6 +505,16 @@ def kill_verified(leg_name: str, pid: int, sid: int) -> bool:
             err(f"{leg_name} leg failed to close pidfd for {pid}: {exc}")
             verified = False
     return verified
+
+
+def kill_verified(leg_name: str, pid: int, sid: int) -> bool:
+    """Kill ``pid`` via a pidfd after re-checking that it belongs to session ``sid``."""
+    return kill_pidfd_matching(leg_name, pid, lambda parsed: parsed[2] == sid)
+
+
+def kill_reparented_child(leg_name: str, pid: int, subreaper_pid: int) -> bool:
+    """Kill ``pid`` via a pidfd after re-checking that ``ppid`` is ``subreaper_pid``."""
+    return kill_pidfd_matching(leg_name, pid, lambda parsed: parsed[1] == subreaper_pid)
 
 
 def kill_session_leftovers(leg_name: str, sid: int, reason: str) -> bool:
@@ -419,13 +555,61 @@ def kill_session_leftovers(leg_name: str, sid: int, reason: str) -> bool:
     return False
 
 
+def drain_waitpid(leg_name: str) -> str:
+    """Reap exited children via ``waitpid(-1, WNOHANG)`` up to ``REAP_DRAIN_LIMIT``."""
+    for _ in range(REAP_DRAIN_LIMIT):
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return DRAIN_EMPTY
+        except OSError as exc:
+            err(f"{leg_name} leg failed to wait for descendants: {exc}")
+            return DRAIN_FAILED
+        if pid == 0:
+            return DRAIN_LIVE
+    return DRAIN_LIVE
+
+
+def reap_orphans(leg_name: str) -> bool:
+    """Kill and reap reparented descendants until ``waitpid`` raises ``ECHILD``.
+
+    Must be called only after the leg's own ``Popen`` child was reaped by
+    ``proc.wait`` so ``waitpid(-1, WNOHANG)`` cannot steal its exit status.
+    """
+    own_pid = os.getpid()
+    for round_idx in range(CLEANUP_ROUNDS + 1):
+        drained = drain_waitpid(leg_name)
+        if drained == DRAIN_EMPTY:
+            return True
+        if drained == DRAIN_FAILED:
+            return False
+        if round_idx == CLEANUP_ROUNDS:
+            break
+        pids = reparented_children_pids(own_pid)
+        if pids is None:
+            err(f"{leg_name} leg cannot read /proc to kill reparented descendants")
+            return False
+        all_killed = True
+        for idx in range(len(pids)):
+            if not kill_reparented_child(leg_name, pids[idx], own_pid):
+                all_killed = False
+        if not all_killed:
+            return False
+        time.sleep(CLEANUP_ROUND_WAIT_SECONDS)
+    err(f"{leg_name} leg: descendants still running after {CLEANUP_ROUNDS} rounds")
+    return False
+
+
 def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
     """Stop a ``cargo mutants`` process with SIGTERM, then SIGKILL.
 
     ``cargo-mutants`` runs in its own session and stays unreaped until session
     cleanup finishes, so its PID keeps the session ID reserved while ``/proc``
-    is scanned and remaining descendants are killed via pidfds. Signals arriving
-    during the stop are only recorded, so the stop always completes.
+    is scanned and remaining descendants are killed via pidfds. After
+    ``proc.wait`` reaps ``cargo-mutants``, child-subreaper cleanup kills and
+    drains reparented orphans until ``waitpid(-1, WNOHANG)`` raises ``ECHILD``.
+    Signals arriving during the stop are only recorded, so the stop always
+    completes.
     """
     signal_leg(proc, signal.SIGTERM)
     if wait_exited(proc.pid, TERMINATE_GRACE_SECONDS):
@@ -447,19 +631,30 @@ def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=KILL_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
         err(f"{leg_name} leg did not exit after kill")
+        return
+    if not reap_orphans(leg_name):
+        err(f"{leg_name} leg stop could not verify that all descendants exited")
 
 
 def reap_exited_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> int | None:
-    """Clean up session leftovers and reap ``proc`` after it has exited."""
+    """Clean up session leftovers, reap ``proc``, and prove no descendants remain.
+
+    After ``proc.wait`` reaps ``cargo-mutants``, child-subreaper cleanup drains
+    reparented descendants until ``waitpid(-1, WNOHANG)`` raises ``ECHILD`` as
+    proof that no descendant remains.
+    """
     cleaned = kill_session_leftovers(leg_name, proc.pid, "exited")
     reaped_rc: int | None = None
     try:
         reaped_rc = proc.wait(timeout=KILL_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
         err(f"{leg_name} leg did not reap after exit")
+    orphans_reaped = False
+    if reaped_rc is not None:
+        orphans_reaped = reap_orphans(leg_name)
     if CANCEL_SIGNALS:
         raise LegCancelled(CANCEL_SIGNALS[0])
-    if reaped_rc is None or not cleaned:
+    if reaped_rc is None or not cleaned or not orphans_reaped:
         return None
     return reaped_rc
 
@@ -469,22 +664,28 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
 
     The executable and subcommand are literals at the call site, each element
     of ``args`` is passed as one argv element without a shell, and the leg runs
-    in a session of its own so every descendant can be found. Processes left in
-    its session after it exits are killed while the unreaped ``cargo-mutants``
-    zombie holds the session ID, and the leg fails when cleanup cannot be
-    verified. Exceeding ``timeout_seconds`` stops the leg with ``SIGTERM`` then
-    ``SIGKILL``. A ``SIGINT`` or ``SIGTERM`` recorded by ``request_cancel``
-    stops a running leg within ``LEG_POLL_SECONDS``, and ``LegCancelled`` is
-    raised if a signal arrived before start, during the poll, during exit
-    cleanup and reap, or during a deadline stop rather than returning ``rc`` or
-    ``None``.
+    in a session of its own so every descendant can be found. Inherited
+    ``CARGO_MUTANTS_*`` environment variables are stripped via
+    ``leg_environment`` so CLI flags govern every run. Processes left in the
+    leg session are killed while the unreaped ``cargo-mutants`` zombie holds the
+    session ID, and child-subreaper orphan cleanup then requires ``waitpid``
+    ``ECHILD`` proof before returning the exit code. Exceeding
+    ``timeout_seconds`` stops the leg with ``SIGTERM`` then ``SIGKILL``. A
+    ``SIGINT`` or ``SIGTERM`` recorded by ``request_cancel`` stops a running leg
+    within ``LEG_POLL_SECONDS``, and ``LegCancelled`` is raised if a signal
+    arrived before start, during the poll, during exit cleanup and reap, or
+    during a deadline stop rather than returning ``rc`` or ``None``.
     """
     sys.stdout.flush()
     sys.stderr.flush()
     if CANCEL_SIGNALS:
         raise LegCancelled(CANCEL_SIGNALS[0])
     try:
-        proc = subprocess.Popen(["cargo", "mutants", *args], start_new_session=True)
+        proc = subprocess.Popen(
+            ["cargo", "mutants", *args],
+            start_new_session=True,
+            env=leg_environment(os.environ),
+        )
     except OSError as exc:
         err(f"{leg_name} leg failed to start cargo-mutants: {exc}")
         if CANCEL_SIGNALS:
@@ -675,7 +876,7 @@ def run_gate_leg() -> int:
     Removes ``.old`` output and checks the unviable ceiling, the caught floor,
     and the tested population floor.
     """
-    gate_rc = run_leg("gate", list(COMMON_ARGS), GATE_TIMEOUT_SECONDS)
+    gate_rc = run_leg("gate", [*COMMON_ARGS, "--output", "."], GATE_TIMEOUT_SECONDS)
     if GATE_OLD_OUTPUT.exists():
         try:
             shutil.rmtree(GATE_OLD_OUTPUT)
@@ -704,6 +905,9 @@ def main() -> int:
     if config is None:
         cancelled = cancel_status()
         return cancelled if cancelled is not None else status
+    if not enable_subreaper():
+        cancelled = cancel_status()
+        return cancelled if cancelled is not None else 1
     try:
         leg_status = run_gate_leg()
         cancelled = cancel_status()

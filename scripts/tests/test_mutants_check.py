@@ -4,19 +4,24 @@
 
 Replays gate count floor/ceiling checks, outcome line counting, planted-leg
 bijection and empty-outcome verification, ``.cargo/mutants.toml`` validation,
-``/proc/<pid>/stat`` parsing and session cleanup error propagation, signal
-cancellation exit handling, and ``cargo mutants`` worker-bound CLI arguments.
+``/proc/<pid>/stat`` parsing and session cleanup error propagation, child
+subreaper and orphan reaping checks, ``CARGO_MUTANTS_*`` environment stripping,
+signal cancellation exit handling, and real Linux descendant cleanup.
 """
 
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib.util
 import io
 import os
+import select
 import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -76,30 +81,77 @@ class GateCountsTests(unittest.TestCase):
         """Verify caught floor, unviable ceiling, and tested population floor."""
         floor = MOD.GATE_CAUGHT_FLOOR
         ceiling = MOD.GATE_UNVIABLE_CEILING
-        self.assertEqual(floor + ceiling, MOD.GATE_MUTANTS_FLOOR)
+        mutants_floor = MOD.GATE_MUTANTS_FLOOR
 
-        ok, out_txt, err_txt = call_quiet(MOD.check_gate_counts, floor, ceiling)
+        pass_caught = max(floor, mutants_floor - ceiling)
+        pass_unviable = ceiling
+        ok, _, err_txt = call_quiet(MOD.check_gate_counts, pass_caught, pass_unviable)
         self.assertTrue(ok)
-        self.assertEqual(out_txt, "")
         self.assertEqual(err_txt, "")
 
-        ok, _, err_txt = call_quiet(MOD.check_gate_counts, floor, ceiling + 1)
+        unviable_fail_caught = max(floor, mutants_floor - (ceiling + 1))
+        ok, _, err_txt = call_quiet(
+            MOD.check_gate_counts, unviable_fail_caught, ceiling + 1
+        )
         self.assertFalse(ok)
         self.assertIn("exceed the ceiling", err_txt)
+        self.assertNotIn("caught mutants below the floor", err_txt)
+        self.assertNotIn("mutants tested below the floor", err_txt)
 
-        ok, _, err_txt = call_quiet(MOD.check_gate_counts, floor - 1, ceiling)
-        self.assertFalse(ok)
-        self.assertIn("caught mutants below the floor", err_txt)
+        min_unviable_for_pop = max(0, mutants_floor - (floor - 1))
+        if min_unviable_for_pop <= ceiling:
+            ok, _, err_txt = call_quiet(
+                MOD.check_gate_counts, floor - 1, min_unviable_for_pop
+            )
+            self.assertFalse(ok)
+            self.assertIn("caught mutants below the floor", err_txt)
+            self.assertNotIn("exceed the ceiling", err_txt)
+            self.assertNotIn("mutants tested below the floor", err_txt)
+        else:
+            with self.subTest(
+                note=(
+                    "caught = floor - 1 cannot meet GATE_MUTANTS_FLOOR within "
+                    "GATE_UNVIABLE_CEILING"
+                )
+            ):
+                ok, _, err_txt = call_quiet(MOD.check_gate_counts, floor - 1, ceiling)
+                self.assertFalse(ok)
+                self.assertIn("caught mutants below the floor", err_txt)
+                self.assertNotIn("exceed the ceiling", err_txt)
 
-        ok, _, err_txt = call_quiet(MOD.check_gate_counts, floor, ceiling - 1)
-        self.assertFalse(ok)
-        self.assertIn("mutants tested below the floor", err_txt)
+        if floor < mutants_floor and ceiling >= 0:
+            pop_fail_unviable = min(ceiling, mutants_floor - 1 - floor)
+            ok, _, err_txt = call_quiet(MOD.check_gate_counts, floor, pop_fail_unviable)
+            self.assertFalse(ok)
+            self.assertIn("mutants tested below the floor", err_txt)
+            self.assertNotIn("caught mutants below the floor", err_txt)
+            self.assertNotIn("exceed the ceiling", err_txt)
+        else:
+            self.assertGreaterEqual(
+                floor,
+                mutants_floor,
+                "population below GATE_MUTANTS_FLOOR is unreachable with "
+                "caught >= GATE_CAUGHT_FLOOR and non-negative unviable",
+            )
 
-        ok, _, err_txt = call_quiet(MOD.check_gate_counts, floor + 1, ceiling - 1)
-        self.assertTrue(ok)
-        self.assertEqual(err_txt, "")
+    def test_check_gate_counts_advisory_notes(self) -> None:
+        """Emit tighten-threshold notes when counts beat configured bounds."""
+        pass_caught = max(
+            MOD.GATE_CAUGHT_FLOOR,
+            MOD.GATE_MUTANTS_FLOOR - MOD.GATE_UNVIABLE_CEILING,
+        )
+        pass_unviable = MOD.GATE_UNVIABLE_CEILING
+        if pass_unviable > 0:
+            ok, out_txt, err_txt = call_quiet(
+                MOD.check_gate_counts, pass_caught + 1, pass_unviable - 1
+            )
+            self.assertTrue(ok)
+            self.assertEqual(err_txt, "")
+            self.assertIn("lower GATE_UNVIABLE_CEILING", out_txt)
 
-        ok, out_txt, err_txt = call_quiet(MOD.check_gate_counts, floor + 1, ceiling)
+        ok, out_txt, err_txt = call_quiet(
+            MOD.check_gate_counts, pass_caught + 1, pass_unviable
+        )
         self.assertTrue(ok)
         self.assertEqual(err_txt, "")
         self.assertIn("raise GATE_CAUGHT_FLOOR", out_txt)
@@ -239,7 +291,7 @@ class VerifyPlantedOutputsTests(unittest.TestCase):
 
 
 class ConfigAndArgvTests(unittest.TestCase):
-    """Replay ``load_config`` validation and ``build_planted_args`` worker bounds."""
+    """Replay config validation, argv construction, and environment sanitization."""
 
     def load_toml_text(self, content: str) -> tuple[object, int, str]:
         """Write ``content`` to a temporary TOML file and call ``load_config``."""
@@ -261,7 +313,7 @@ class ConfigAndArgvTests(unittest.TestCase):
         self.assertEqual(err_txt, "")
         self.assertIsInstance(cfg, MOD.MutantsConfig)
         if not isinstance(cfg, MOD.MutantsConfig):
-            raise AssertionError("expected MutantsConfig")
+            self.fail("expected MutantsConfig")
         self.assertTrue(cfg.cap_lints)
         self.assertEqual(cfg.additional_cargo_args, ["--locked"])
         self.assertEqual(len(cfg.exclude_re), 2)
@@ -316,22 +368,88 @@ class ConfigAndArgvTests(unittest.TestCase):
         self.assertEqual(args[jobs_idx : jobs_idx + 2], ["--jobs", "1"])
         self.assertEqual(args[-2:], ["-F", "last_pat$"])
 
+    def test_leg_environment_strips_cargo_mutants_vars(self) -> None:
+        """Drop ``CARGO_MUTANTS_*`` keys, keep the rest, leave the input unchanged."""
+        source = {
+            "PATH": "/usr/bin",
+            "CARGO_HOME": "/tmp/cargo",
+            "CARGO_MUTANTS_OUTPUT": "/tmp/stale-out",
+            "CARGO_MUTANTS_JOBS": "16",
+            "CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT": "300",
+            "CARGO_MUTANTS_TRACE_LEVEL": "debug",
+            "CARGO_MUTANTS_EXTRA": "1",
+        }
+        snapshot = dict(source)
+        cleaned = MOD.leg_environment(source)
+        self.assertEqual(source, snapshot)
+        self.assertEqual(
+            cleaned,
+            {
+                "PATH": "/usr/bin",
+                "CARGO_HOME": "/tmp/cargo",
+            },
+        )
+
+    def test_gate_leg_passes_explicit_output_dot(self) -> None:
+        """Verify ``run_gate_leg`` passes ``--output .`` to ``run_leg``."""
+        with (
+            mock.patch.object(MOD, "run_leg", return_value=1) as mock_run_leg,
+            mock.patch.object(Path, "exists", return_value=False),
+        ):
+            rc, _, err_txt = call_quiet(MOD.run_gate_leg)
+        self.assertEqual(rc, 1)
+        self.assertIn("gate leg failed", err_txt)
+        mock_run_leg.assert_called_once()
+        leg_name, leg_args, leg_timeout = mock_run_leg.call_args.args
+        self.assertEqual(leg_name, "gate")
+        self.assertEqual(leg_timeout, MOD.GATE_TIMEOUT_SECONDS)
+        out_idx = leg_args.index("--output")
+        self.assertEqual(leg_args[out_idx : out_idx + 2], ["--output", "."])
+
+    def test_run_leg_passes_sanitized_env_to_popen(self) -> None:
+        """Verify ``run_leg`` strips ``CARGO_MUTANTS_OUTPUT`` from ``Popen`` ``env``."""
+        MOD.CANCEL_SIGNALS.clear()
+        fake_proc = mock.MagicMock()
+        fake_proc.pid = 777
+        fake_proc.wait.return_value = 0
+        env_overrides = {
+            "CARGO_MUTANTS_OUTPUT": "/tmp/override",
+            "CARGO_MUTANTS_JOBS": "9",
+            "MUTANTS_CHECK_KEEP": "present",
+        }
+        with (
+            mock.patch.dict(os.environ, env_overrides, clear=False),
+            mock.patch.object(
+                MOD.subprocess, "Popen", return_value=fake_proc
+            ) as mock_popen,
+            mock.patch.object(MOD, "wait_exited", return_value=True),
+            mock.patch.object(MOD, "reap_exited_leg", return_value=0),
+        ):
+            rc, _, err_txt = call_quiet(MOD.run_leg, "gate", ["--output", "."], 5)
+        self.assertEqual(rc, 0)
+        self.assertEqual(err_txt, "")
+        popen_env = mock_popen.call_args.kwargs["env"]
+        self.assertNotIn("CARGO_MUTANTS_OUTPUT", popen_env)
+        self.assertNotIn("CARGO_MUTANTS_JOBS", popen_env)
+        self.assertEqual(popen_env.get("MUTANTS_CHECK_KEEP"), "present")
+
 
 class ProcCleanupTests(unittest.TestCase):
     """Replay ``parse_proc_stat``, ``read_proc_state_session``, and session cleanup."""
 
     def test_parse_proc_stat(self) -> None:
-        """Verify ``comm`` with spaces and ``)`` parses and malformed inputs fail."""
+        """Verify ``(state, ppid, session)`` parses and malformed inputs fail."""
         self.assertEqual(
             MOD.parse_proc_stat("123 (a b) c) S 1 123 123 0 -1"),
-            ("S", 123),
+            ("S", 1, 123),
         )
         self.assertEqual(
-            MOD.parse_proc_stat("123 (a b) c) R 1 77 456 0 -1"),
-            ("R", 456),
+            MOD.parse_proc_stat("123 (a b) c) R 42 77 456 0 -1"),
+            ("R", 42, 456),
         )
         self.assertIsNone(MOD.parse_proc_stat("123 missing_rparen S 1 123 123"))
         self.assertIsNone(MOD.parse_proc_stat("123 (comm) S 1 123"))
+        self.assertIsNone(MOD.parse_proc_stat("123 (comm) S bad_ppid 123 123 0"))
         self.assertIsNone(MOD.parse_proc_stat("123 (comm) S 1 123 not_an_int 0"))
 
     def test_read_proc_state_session_outcomes(self) -> None:
@@ -421,6 +539,74 @@ class ProcCleanupTests(unittest.TestCase):
             self.assertEqual(pids, [4243])
             self.assertEqual(err_txt, "")
 
+    def test_session_live_pids_zombie_and_dead_states(self) -> None:
+        """Include zombie leaders with live threads while skipping exited Z and X."""
+        poller_live = mock.MagicMock()
+        poller_live.poll.return_value = []
+        poller_exited = mock.MagicMock()
+        poller_exited.poll.return_value = [(11, select.POLLIN)]
+        entries = ["500", "601", "602", "603", "604"]
+        stats = [
+            "500 (leader) Z 1 500 500 0 -1",
+            "601 (live_threads) Z 500 500 500 0 -1",
+            "602 (exited_group) Z 500 500 500 0 -1",
+            "603 (dead_proc) X 500 500 500 0 -1",
+            "604 (vanished_z) Z 500 500 500 0 -1",
+        ]
+        with (
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(os, "listdir", return_value=entries),
+            mock.patch.object(Path, "read_text", side_effect=stats),
+            mock.patch.object(
+                os,
+                "pidfd_open",
+                side_effect=[10, 11, ProcessLookupError("gone")],
+                create=True,
+            ) as mock_open,
+            mock.patch.object(os, "close") as mock_close,
+            mock.patch.object(select, "poll", side_effect=[poller_live, poller_exited]),
+        ):
+            pids, _, err_txt = call_quiet(MOD.session_live_pids, 500)
+        self.assertEqual(pids, [601])
+        self.assertEqual(err_txt, "")
+        opened_pids: list[int] = []
+        for idx in range(len(mock_open.call_args_list)):
+            opened_pids.append(mock_open.call_args_list[idx].args[0])
+        self.assertEqual(opened_pids, [601, 602, 604])
+        self.assertEqual(mock_close.call_count, 2)
+
+    def test_session_live_pids_pidfd_errors_fail_closed(self) -> None:
+        """Return ``None`` when ``pidfd_open`` or ``close`` fails on a zombie entry."""
+        with (
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(os, "listdir", return_value=["601"]),
+            mock.patch.object(
+                Path, "read_text", return_value="601 (z) Z 500 500 500 0 -1"
+            ),
+            mock.patch.object(
+                os, "pidfd_open", side_effect=PermissionError("denied"), create=True
+            ),
+        ):
+            pids, _, err_txt = call_quiet(MOD.session_live_pids, 500)
+            self.assertIsNone(pids)
+            self.assertIn("601", err_txt)
+
+        poller_exited = mock.MagicMock()
+        poller_exited.poll.return_value = [(12, select.POLLIN)]
+        with (
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(os, "listdir", return_value=["602"]),
+            mock.patch.object(
+                Path, "read_text", return_value="602 (z) Z 500 500 500 0 -1"
+            ),
+            mock.patch.object(os, "pidfd_open", return_value=12, create=True),
+            mock.patch.object(select, "poll", return_value=poller_exited),
+            mock.patch.object(os, "close", side_effect=OSError("bad fd")),
+        ):
+            pids, _, err_txt = call_quiet(MOD.session_live_pids, 500)
+            self.assertIsNone(pids)
+            self.assertIn("602", err_txt)
+
     def test_kill_verified_recheck_outcomes(self) -> None:
         """Verify pidfd re-read skips vanished or foreign PIDs and fails on errors."""
         with (
@@ -470,7 +656,193 @@ class ProcCleanupTests(unittest.TestCase):
         self.assertIsNotNone(res.parsed)
         if res.parsed is None:
             raise AssertionError("expected live /proc stat to parse")
-        self.assertEqual(res.parsed[1], os.getsid(0))
+        self.assertEqual(res.parsed[1], os.getppid())
+        self.assertEqual(res.parsed[2], os.getsid(0))
+
+
+class SubreaperAndOrphanTests(unittest.TestCase):
+    """Replay ``enable_subreaper``, ``reap_orphans``, and reap ordering fixtures."""
+
+    def setUp(self) -> None:
+        """Clear ``CANCEL_SIGNALS`` before and after each test."""
+        MOD.CANCEL_SIGNALS.clear()
+        self.addCleanup(MOD.CANCEL_SIGNALS.clear)
+
+    def test_enable_subreaper_and_main_fail_closed(self) -> None:
+        """Fail closed when ``prctl`` fails and return ``1`` from ``main``."""
+        fake_libc = mock.MagicMock()
+        fake_libc.prctl.return_value = -1
+        with (
+            mock.patch.object(MOD.ctypes, "CDLL", return_value=fake_libc),
+            mock.patch.object(MOD.ctypes, "get_errno", return_value=errno.EPERM),
+        ):
+            ok, _, err_txt = call_quiet(MOD.enable_subreaper)
+        self.assertFalse(ok)
+        self.assertIn(os.strerror(errno.EPERM), err_txt)
+
+        fake_libc.prctl.return_value = 0
+        with mock.patch.object(MOD.ctypes, "CDLL", return_value=fake_libc):
+            ok, _, err_txt = call_quiet(MOD.enable_subreaper)
+        self.assertTrue(ok)
+        self.assertEqual(err_txt, "")
+
+        compiled, _, _ = call_quiet(MOD.compile_exclusions, ["pat$"], Path("fixture"))
+        cfg = MOD.MutantsConfig(compiled or [], [], True)
+        with (
+            mock.patch.object(signal, "signal"),
+            mock.patch.object(MOD, "load_config", return_value=(cfg, 0)),
+            mock.patch.object(MOD, "enable_subreaper", return_value=False),
+            mock.patch.object(MOD, "run_gate_leg") as mock_gate,
+        ):
+            rc, _, _ = call_quiet(MOD.main)
+        self.assertEqual(rc, 1)
+        mock_gate.assert_not_called()
+
+    def test_reap_orphans_drain_and_kill_rounds(self) -> None:
+        """Prove ``ECHILD`` immediately, after zombie drain, and after pidfd kill."""
+        with mock.patch.object(os, "waitpid", side_effect=ChildProcessError("echild")):
+            ok, _, err_txt = call_quiet(MOD.reap_orphans, "gate")
+        self.assertTrue(ok)
+        self.assertEqual(err_txt, "")
+
+        with mock.patch.object(
+            os, "waitpid", side_effect=[(801, 0), ChildProcessError("echild")]
+        ):
+            ok, _, err_txt = call_quiet(MOD.reap_orphans, "gate")
+        self.assertTrue(ok)
+        self.assertEqual(err_txt, "")
+
+        own_pid = os.getpid()
+        child_stat = f"802 (orphan) S {own_pid} 802 802 0 -1"
+        with (
+            mock.patch.object(
+                os,
+                "waitpid",
+                side_effect=[(0, 0), (802, 0), ChildProcessError("echild")],
+            ),
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(os, "listdir", return_value=["802"]),
+            mock.patch.object(Path, "read_text", side_effect=[child_stat, child_stat]),
+            mock.patch.object(os, "pidfd_open", return_value=14, create=True),
+            mock.patch.object(os, "close"),
+            mock.patch.object(signal, "pidfd_send_signal", create=True) as mock_send,
+            mock.patch.object(time, "sleep"),
+        ):
+            ok, _, err_txt = call_quiet(MOD.reap_orphans, "gate")
+        self.assertTrue(ok)
+        self.assertEqual(err_txt, "")
+        mock_send.assert_called_once_with(14, signal.SIGKILL)
+
+    def test_reap_orphans_failure_paths(self) -> None:
+        """Fail closed on persistent live descendants, drain cap, or ``/proc`` error."""
+        with (
+            mock.patch.object(os, "waitpid", return_value=(0, 0)),
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(os, "listdir", return_value=[]),
+            mock.patch.object(time, "sleep"),
+        ):
+            ok, _, err_txt = call_quiet(MOD.reap_orphans, "gate")
+        self.assertFalse(ok)
+        self.assertIn(
+            f"descendants still running after {MOD.CLEANUP_ROUNDS} rounds", err_txt
+        )
+
+        with (
+            mock.patch.object(os, "waitpid", return_value=(0, 0)),
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(os, "listdir", side_effect=PermissionError("denied")),
+        ):
+            ok, _, err_txt = call_quiet(MOD.reap_orphans, "gate")
+        self.assertFalse(ok)
+        self.assertIn("/proc", err_txt)
+
+        with (
+            mock.patch.object(MOD, "REAP_DRAIN_LIMIT", 2),
+            mock.patch.object(os, "waitpid", return_value=(888, 0)),
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(os, "listdir", return_value=[]),
+            mock.patch.object(time, "sleep"),
+        ):
+            ok, _, err_txt = call_quiet(MOD.reap_orphans, "gate")
+        self.assertFalse(ok)
+        self.assertIn("descendants still running", err_txt)
+
+    def test_reap_exited_leg_order_and_failure_propagation(self) -> None:
+        """Call ``reap_orphans`` only after ``proc.wait`` and propagate failure."""
+        events: list[str] = []
+        fake_proc = mock.MagicMock()
+        fake_proc.pid = 700
+
+        def rec_session(_leg: str, _sid: int, _reason: str) -> bool:
+            """Record ``kill_session_leftovers`` in ``events``."""
+            events.append("session")
+            return True
+
+        def rec_wait(*_args: object, **_kwargs: object) -> int:
+            """Record ``proc.wait`` in ``events``."""
+            events.append("wait")
+            return 0
+
+        def rec_orphans(_leg: str) -> bool:
+            """Record ``reap_orphans`` in ``events``."""
+            events.append("orphans")
+            return True
+
+        fake_proc.wait.side_effect = rec_wait
+        with (
+            mock.patch.object(MOD, "kill_session_leftovers", side_effect=rec_session),
+            mock.patch.object(MOD, "reap_orphans", side_effect=rec_orphans),
+        ):
+            rc, _, err_txt = call_quiet(MOD.reap_exited_leg, "gate", fake_proc)
+        self.assertEqual(rc, 0)
+        self.assertEqual(err_txt, "")
+        self.assertEqual(events, ["session", "wait", "orphans"])
+
+        fake_proc.wait.side_effect = None
+        fake_proc.wait.return_value = 0
+        with (
+            mock.patch.object(MOD, "kill_session_leftovers", return_value=True),
+            mock.patch.object(MOD, "reap_orphans", return_value=False),
+        ):
+            rc, _, _ = call_quiet(MOD.reap_exited_leg, "gate", fake_proc)
+        self.assertIsNone(rc)
+
+        fake_proc.wait.side_effect = subprocess.TimeoutExpired(["cargo"], 1)
+        with (
+            mock.patch.object(MOD, "kill_session_leftovers", return_value=True),
+            mock.patch.object(MOD, "reap_orphans") as mock_orphans,
+        ):
+            rc, _, err_txt = call_quiet(MOD.reap_exited_leg, "gate", fake_proc)
+        self.assertIsNone(rc)
+        self.assertIn("did not reap", err_txt)
+        mock_orphans.assert_not_called()
+
+    def test_stop_leg_reaps_orphans_after_wait(self) -> None:
+        """Call ``reap_orphans`` after ``proc.wait`` in ``stop_leg`` and log failure."""
+        events: list[str] = []
+        fake_proc = mock.MagicMock()
+        fake_proc.pid = 701
+
+        def rec_wait(*_args: object, **_kwargs: object) -> int:
+            """Record ``proc.wait`` in ``events``."""
+            events.append("wait")
+            return 0
+
+        def rec_orphans_fail(_leg: str) -> bool:
+            """Record ``reap_orphans`` in ``events`` and return ``False``."""
+            events.append("orphans")
+            return False
+
+        fake_proc.wait.side_effect = rec_wait
+        with (
+            mock.patch.object(MOD, "signal_leg"),
+            mock.patch.object(MOD, "wait_exited", return_value=True),
+            mock.patch.object(MOD, "kill_session_leftovers", return_value=True),
+            mock.patch.object(MOD, "reap_orphans", side_effect=rec_orphans_fail),
+        ):
+            _, _, err_txt = call_quiet(MOD.stop_leg, "gate", fake_proc)
+        self.assertEqual(events, ["wait", "orphans"])
+        self.assertIn("descendants", err_txt)
 
 
 class CancellationTests(unittest.TestCase):
@@ -505,6 +877,7 @@ class CancellationTests(unittest.TestCase):
         with (
             mock.patch.object(signal, "signal"),
             mock.patch.object(MOD, "load_config", return_value=(cfg, 0)),
+            mock.patch.object(MOD, "enable_subreaper", return_value=True),
             mock.patch.object(MOD, "run_gate_leg", return_value=0),
             mock.patch.object(MOD, "run_planted_leg", side_effect=cancel_in_planted),
         ):
@@ -522,6 +895,7 @@ class CancellationTests(unittest.TestCase):
         with (
             mock.patch.object(signal, "signal"),
             mock.patch.object(MOD, "load_config", return_value=(cfg, 0)),
+            mock.patch.object(MOD, "enable_subreaper", return_value=True),
             mock.patch.object(MOD, "run_gate_leg", side_effect=cancel_in_gate),
             mock.patch.object(MOD, "run_planted_leg") as mock_planted,
         ):
@@ -547,6 +921,7 @@ class CancellationTests(unittest.TestCase):
             mock.patch.object(
                 MOD, "kill_session_leftovers", side_effect=cancel_during_cleanup
             ),
+            mock.patch.object(MOD, "reap_orphans", return_value=True),
         ):
             with self.assertRaises(MOD.LegCancelled) as ctx:
                 call_quiet(MOD.run_leg, "gate", [], 5)
@@ -566,6 +941,117 @@ class CancellationTests(unittest.TestCase):
             with self.assertRaises(MOD.LegCancelled) as ctx:
                 call_quiet(MOD.run_leg, "gate", [], 0)
             self.assertEqual(ctx.exception.signum, int(signal.SIGINT))
+
+
+@unittest.skipUnless(
+    sys.platform.startswith("linux") and hasattr(os, "pidfd_open"),
+    "requires Linux pidfd support",
+)
+class RealDescendantCleanupTests(unittest.TestCase):
+    """Exercise live descendant cleanup on timeout and immediate exit paths."""
+
+    def setUp(self) -> None:
+        """Create temporary stub/FIFO fixtures and enable child subreaper."""
+        MOD.CANCEL_SIGNALS.clear()
+        self.tmp_dir = tempfile.TemporaryDirectory(prefix="mutants-descendant-")
+        self.base = Path(self.tmp_dir.name)
+        self.fifo_path = self.base / "grandchild.fifo"
+        self.ready_path = self.base / "ready.fifo"
+        self.pid_file = self.base / "grandchild.pid"
+        self.stub_path = self.base / "cargo"
+        os.mkfifo(self.fifo_path, 0o600)
+        os.mkfifo(self.ready_path, 0o600)
+        self.assertTrue(MOD.enable_subreaper())
+        self.fifo_fd = os.open(self.fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+
+    def tearDown(self) -> None:
+        """Close the FIFO, kill any leaked grandchild via pidfd, and remove temp dir."""
+        MOD.CANCEL_SIGNALS.clear()
+        if self.fifo_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(self.fifo_fd)
+            self.fifo_fd = -1
+        if self.pid_file.is_file():
+            raw_pid = self.pid_file.read_text(encoding="utf-8").strip()
+            if raw_pid.isascii() and raw_pid.isdigit():
+                pid = int(raw_pid)
+                if pid > 1:
+                    self._kill_leftover_pid(pid)
+        for _ in range(16):
+            try:
+                reaped_pid, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if reaped_pid == 0:
+                break
+        self.tmp_dir.cleanup()
+
+    def _kill_leftover_pid(self, pid: int) -> None:
+        """Send ``SIGKILL`` to ``pid`` above ``1`` via pidfd when still present."""
+        if pid <= 1:
+            return
+        try:
+            fd = os.pidfd_open(pid)
+        except (FileNotFoundError, ProcessLookupError, OSError):
+            return
+        try:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    def _write_cargo_stub(self, launcher_prefix: str, tail_cmd: str) -> None:
+        """Write an executable ``cargo`` shell stub spawning a FIFO-holding child."""
+        script = (
+            "#!/bin/sh\n"
+            f"{launcher_prefix} sh -c '\n"
+            '  printf "%s\\n" "$$" > "$1"\n'
+            '  exec 3>"$2"\n'
+            '  printf "x" >&3\n'
+            '  printf "r\\n" > "$3"\n'
+            "  exec sleep 60\n"
+            f'\' sh "{self.pid_file}" "{self.fifo_path}" "{self.ready_path}" '
+            "</dev/null >/dev/null 2>&1 &\n"
+            f'read -r _ < "{self.ready_path}"\n'
+            f"{tail_cmd}\n"
+        )
+        self.stub_path.write_text(script, encoding="utf-8")
+        os.chmod(self.stub_path, 0o755)
+
+    def _assert_fifo_byte_then_eof(self) -> None:
+        """Verify the grandchild wrote one byte and every writer closed the FIFO."""
+        first = os.read(self.fifo_fd, 1)
+        self.assertEqual(first, b"x")
+        try:
+            second = os.read(self.fifo_fd, 1)
+        except BlockingIOError as exc:
+            self.fail(f"grandchild writer still alive holding FIFO write end: {exc}")
+        self.assertEqual(second, b"")
+
+    def test_timeout_stops_real_descendant(self) -> None:
+        """Stop a timed-out stub and verify its background grandchild reaches EOF."""
+        self._write_cargo_stub("", "exec sleep 60")
+        prepended_path = f"{self.base}{os.pathsep}{os.environ.get('PATH', '')}"
+        with (
+            mock.patch.dict(os.environ, {"PATH": prepended_path}),
+            mock.patch.object(MOD, "TERMINATE_GRACE_SECONDS", 1),
+        ):
+            rc, _, err_txt = call_quiet(MOD.run_leg, "gate", [], 2)
+        self.assertIsNone(rc)
+        self.assertIn("exceeded its 2s deadline", err_txt)
+        self._assert_fifo_byte_then_eof()
+
+    def test_exit_reaps_setsid_orphan_before_returning(self) -> None:
+        """Kill and reap a ``setsid`` grandchild before returning exit code ``0``."""
+        # Kills mutation reap_orphans -> return True, which keeps grandchild alive.
+        self._write_cargo_stub("setsid", "exit 0")
+        prepended_path = f"{self.base}{os.pathsep}{os.environ.get('PATH', '')}"
+        with mock.patch.dict(os.environ, {"PATH": prepended_path}):
+            rc, _, err_txt = call_quiet(MOD.run_leg, "gate", [], 5)
+        self.assertEqual(rc, 0)
+        self.assertEqual(err_txt, "")
+        self._assert_fifo_byte_then_eof()
 
 
 if __name__ == "__main__":
