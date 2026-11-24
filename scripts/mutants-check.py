@@ -20,9 +20,11 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType
 
 CONFIG_PATH = Path(".cargo/mutants.toml")
 ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
@@ -37,6 +39,11 @@ PLANTED_TIMEOUT_SECONDS = 600
 TERMINATE_GRACE_SECONDS = 60
 # Reap deadline after SIGKILL so a stuck process cannot block indefinitely.
 KILL_WAIT_SECONDS = 10
+# Upper bound on the delay between a recorded SIGINT/SIGTERM and the start of
+# the leg stop.
+LEG_POLL_SECONDS = 1
+# First SIGINT or SIGTERM the script received; set only by request_cancel.
+CANCEL_SIGNALS: list[int] = []
 # Minimum whitespace-separated fields after ``)`` in /proc/<pid>/stat for session.
 MIN_PROC_STAT_FIELDS = 4
 EMPTY_OUTCOME_FILES = ("caught.txt", "timeout.txt", "unviable.txt")
@@ -56,9 +63,27 @@ class MutantsConfig:
     cap_lints: bool
 
 
+class LegCancelled(Exception):
+    """Raised by ``run_leg`` after it stopped a leg on ``SIGINT`` or ``SIGTERM``."""
+
+    def __init__(self, signum: int) -> None:
+        """Store the signal number ``signum`` that cancelled the leg."""
+        self.signum = signum
+        super().__init__(signum)
+
+
 def err(message: str) -> None:
     """Write a prefixed diagnostic message to standard error."""
     print(f"mutants-check: {message}", file=sys.stderr)
+
+
+def request_cancel(signum: int, frame: FrameType | None) -> None:
+    """Record the first ``SIGINT`` or ``SIGTERM`` in ``CANCEL_SIGNALS``.
+
+    Never raises, so a later signal cannot cut a leg stop short.
+    """
+    if not CANCEL_SIGNALS:
+        CANCEL_SIGNALS.append(signum)
 
 
 def parse_string_list(raw: object, key: str, path: Path) -> list[str] | None:
@@ -226,7 +251,8 @@ def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
     deadline on ``SIGTERM``. When ``SIGTERM`` times out, ``cargo-mutants`` is
     killed with ``SIGKILL`` first and remaining process groups in its session,
     including reparented descendants, are discovered from ``/proc`` and killed
-    by group; without ``/proc`` they may keep running.
+    by group; without ``/proc`` they may keep running. Signals arriving during
+    the stop are only recorded, so the stop always completes.
     """
     proc.terminate()
     try:
@@ -263,25 +289,39 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
     The executable and subcommand are literals at the call site, each element
     of ``args`` is passed as one argv element without a shell, and the leg runs
     in a session of its own so every descendant can be found. Exceeding
-    ``timeout_seconds`` stops the leg with ``SIGTERM`` then ``SIGKILL``, and
-    Ctrl-C or ``SIGTERM`` to the script stops the leg the same way.
+    ``timeout_seconds`` stops the leg with ``SIGTERM`` then ``SIGKILL``. A
+    ``SIGINT`` or ``SIGTERM`` to the script is recorded by ``request_cancel``
+    and stops the leg the same way within ``LEG_POLL_SECONDS``, then
+    ``LegCancelled`` is raised; the return value is unchanged otherwise.
     """
     sys.stdout.flush()
     sys.stderr.flush()
+    if CANCEL_SIGNALS:
+        raise LegCancelled(CANCEL_SIGNALS[0])
     try:
         proc = subprocess.Popen(["cargo", "mutants", *args], start_new_session=True)
     except OSError as exc:
         err(f"{leg_name} leg failed to start cargo-mutants: {exc}")
         return None
-    try:
-        return proc.wait(timeout=timeout_seconds)
-    except KeyboardInterrupt:
-        stop_leg(leg_name, proc)
-        raise
-    except subprocess.TimeoutExpired:
-        err(f"{leg_name} leg exceeded its {timeout_seconds}s deadline")
-        stop_leg(leg_name, proc)
-        return None
+    deadline = time.monotonic() + timeout_seconds
+    for _ in range(timeout_seconds // LEG_POLL_SECONDS + 2):
+        if CANCEL_SIGNALS:
+            err(
+                f"{leg_name} leg cancelled by "
+                f"{signal.Signals(CANCEL_SIGNALS[0]).name}; stopping cargo-mutants"
+            )
+            stop_leg(leg_name, proc)
+            raise LegCancelled(CANCEL_SIGNALS[0])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            return proc.wait(timeout=min(LEG_POLL_SECONDS, remaining))
+        except subprocess.TimeoutExpired:
+            continue
+    err(f"{leg_name} leg exceeded its {timeout_seconds}s deadline")
+    stop_leg(leg_name, proc)
+    return None
 
 
 def read_outcome_file(mutants_out: Path, name: str) -> list[str] | None:
@@ -425,15 +465,21 @@ def run_gate_leg() -> int:
 
 def main() -> int:
     """Run configuration validation, the gate leg, and the planted leg."""
-    # Raise KeyboardInterrupt on SIGTERM so run_leg stops the active leg session.
-    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    # Signals are recorded, never raised, so a leg stop cannot be interrupted
+    # (cargo-mutants runs in its own session and does not get them).
+    signal.signal(signal.SIGINT, request_cancel)
+    signal.signal(signal.SIGTERM, request_cancel)
     config, status = load_config(CONFIG_PATH)
     if config is None:
         return status
-    gate_status = run_gate_leg()
-    if gate_status != 0:
-        return gate_status
-    return run_planted_leg(config)
+    try:
+        gate_status = run_gate_leg()
+        if gate_status != 0:
+            return gate_status
+        return run_planted_leg(config)
+    except LegCancelled as exc:
+        err(f"cancelled by {signal.Signals(exc.signum).name}")
+        return 128 + exc.signum
 
 
 if __name__ == "__main__":
