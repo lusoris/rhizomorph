@@ -52,6 +52,9 @@ MISSED_EXIT_CODE = 2
 # Unviable gate mutants measured 2026-11-24 with cap_lints (68 without); raise it
 # only in a reviewed change.
 GATE_UNVIABLE_CEILING = 31
+# Caught gate mutants measured on CI 2026-11-24 at 3737b36 (143 tested, 31 unviable);
+# lower it only in a reviewed change.
+GATE_CAUGHT_FLOOR = 112
 
 
 @dataclass(frozen=True)
@@ -243,16 +246,34 @@ def kill_process_group(leg_name: str, pgid: int) -> None:
         err(f"{leg_name} leg failed to kill process group {pgid}: {exc}")
 
 
+def kill_session_leftovers(leg_name: str, sid: int, reason: str) -> None:
+    """Kill every process group still in ``cargo-mutants`` session ``sid``.
+
+    Covers descendants that ignored ``SIGTERM`` or were reparented after
+    ``cargo-mutants`` ended; Linux only, no-op without ``/proc``. The kernel
+    keeps a session ID reserved while any process holds it, so the scan cannot
+    reach an unrelated session while leftovers exist.
+    """
+    groups = session_process_groups(sid)
+    if not groups:
+        return
+    err(
+        f"{leg_name} leg {reason} left {len(groups)} process groups in its "
+        "session; killing them"
+    )
+    for idx in range(len(groups)):
+        kill_process_group(leg_name, groups[idx])
+
+
 def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
     """Stop a ``cargo mutants`` process with SIGTERM, then SIGKILL.
 
     ``cargo-mutants`` runs in its own session and starts each cargo build and
     test child in its own process group, waiting for those groups without a
-    deadline on ``SIGTERM``. When ``SIGTERM`` times out, ``cargo-mutants`` is
-    killed with ``SIGKILL`` first and remaining process groups in its session,
-    including reparented descendants, are discovered from ``/proc`` and killed
-    by group; without ``/proc`` they may keep running. Signals arriving during
-    the stop are only recorded, so the stop always completes.
+    deadline on ``SIGTERM``. After either stop path, remaining process groups in
+    its session, including reparented descendants, are discovered from ``/proc``
+    and killed by group; without ``/proc`` they may keep running. Signals
+    arriving during the stop are only recorded, so the stop always completes.
     """
     proc.terminate()
     try:
@@ -260,6 +281,7 @@ def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         pass
     else:
+        kill_session_leftovers(leg_name, proc.pid, "stopped by SIGTERM")
         return
     proc.kill()
     groups = session_process_groups(proc.pid)
@@ -288,11 +310,12 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
 
     The executable and subcommand are literals at the call site, each element
     of ``args`` is passed as one argv element without a shell, and the leg runs
-    in a session of its own so every descendant can be found. Exceeding
-    ``timeout_seconds`` stops the leg with ``SIGTERM`` then ``SIGKILL``. A
-    ``SIGINT`` or ``SIGTERM`` to the script is recorded by ``request_cancel``
-    and stops the leg the same way within ``LEG_POLL_SECONDS``, then
-    ``LegCancelled`` is raised; the return value is unchanged otherwise.
+    in a session of its own so every descendant can be found. Process groups
+    left in its session after it exits are killed. Exceeding ``timeout_seconds``
+    stops the leg with ``SIGTERM`` then ``SIGKILL``. A ``SIGINT`` or ``SIGTERM``
+    to the script is recorded by ``request_cancel`` and stops the leg the same
+    way within ``LEG_POLL_SECONDS``, then ``LegCancelled`` is raised; the return
+    value is unchanged otherwise.
     """
     sys.stdout.flush()
     sys.stderr.flush()
@@ -316,9 +339,11 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
         if remaining <= 0:
             break
         try:
-            return proc.wait(timeout=min(LEG_POLL_SECONDS, remaining))
+            rc = proc.wait(timeout=min(LEG_POLL_SECONDS, remaining))
         except subprocess.TimeoutExpired:
             continue
+        kill_session_leftovers(leg_name, proc.pid, f"exited {rc} and")
+        return rc
     err(f"{leg_name} leg exceeded its {timeout_seconds}s deadline")
     stop_leg(leg_name, proc)
     return None
@@ -335,6 +360,18 @@ def read_outcome_file(mutants_out: Path, name: str) -> list[str] | None:
     if not content:
         return []
     return content.splitlines()
+
+
+def count_outcome_lines(mutants_out: Path, name: str) -> int | None:
+    """Count non-empty lines in ``mutants_out / name``, or return ``None``."""
+    lines = read_outcome_file(mutants_out, name)
+    if lines is None:
+        return None
+    count = 0
+    for idx in range(len(lines)):
+        if lines[idx]:
+            count += 1
+    return count
 
 
 def check_empty_outcomes(mutants_out: Path) -> bool | None:
@@ -428,7 +465,11 @@ def run_planted_leg(config: MutantsConfig) -> int:
 
 
 def run_gate_leg() -> int:
-    """Execute the gate leg, remove ``.old`` output, and check unviable count."""
+    """Execute the gate leg and verify its outcome counts.
+
+    Removes ``.old`` output and checks the unviable ceiling and the caught
+    floor.
+    """
     gate_rc = run_leg("gate", list(COMMON_ARGS), GATE_TIMEOUT_SECONDS)
     if GATE_OLD_OUTPUT.exists():
         try:
@@ -441,26 +482,36 @@ def run_gate_leg() -> int:
     if gate_rc != 0:
         err(f"gate leg failed (cargo-mutants exit {gate_rc})")
         return 1
-    lines = read_outcome_file(GATE_OUTPUT, "unviable.txt")
-    if lines is None:
+    unviable = count_outcome_lines(GATE_OUTPUT, "unviable.txt")
+    caught = count_outcome_lines(GATE_OUTPUT, "caught.txt")
+    if unviable is None or caught is None:
         return 1
-    n = 0
-    for idx in range(len(lines)):
-        if lines[idx]:
-            n += 1
-    if n > GATE_UNVIABLE_CEILING:
+    failed = False
+    if unviable > GATE_UNVIABLE_CEILING:
         err(
-            f"gate leg: {n} unviable mutants exceed the ceiling of "
+            f"gate leg: {unviable} unviable mutants exceed the ceiling of "
             f"{GATE_UNVIABLE_CEILING}; a config or code change stopped them "
             "from building"
         )
-        return 1
-    if n < GATE_UNVIABLE_CEILING:
+        failed = True
+    elif unviable < GATE_UNVIABLE_CEILING:
         print(
-            f"mutants-check: gate unviable {n} below ceiling "
+            f"mutants-check: gate unviable {unviable} below ceiling "
             f"{GATE_UNVIABLE_CEILING}; lower GATE_UNVIABLE_CEILING"
         )
-    return 0
+    if caught < GATE_CAUGHT_FLOOR:
+        err(
+            f"gate leg: {caught} caught mutants below the floor of "
+            f"{GATE_CAUGHT_FLOOR}; a skip attribute, an exclude or a "
+            "cargo-mutants change dropped mutants from the gate"
+        )
+        failed = True
+    elif caught > GATE_CAUGHT_FLOOR:
+        print(
+            f"mutants-check: gate caught {caught} above floor "
+            f"{GATE_CAUGHT_FLOOR}; raise GATE_CAUGHT_FLOOR"
+        )
+    return 1 if failed else 0
 
 
 def main() -> int:

@@ -207,4 +207,8 @@ jobs:
           tool: cargo-mutants@27.1.0
       - name: Run kernel mutation tests and replay the excluded mutants
         if: github.event.pull_request.draft != true
+        # Process deadline for the script, its file and /proc reads included:
+        # 28 min covers both legs plus stop time (1640 s) and stays below the
+        # 30 min job limit.
+        timeout-minutes: 28
         run: python3 scripts/mutants-check.py
