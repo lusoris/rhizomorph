@@ -52,7 +52,7 @@ release:
         - "crates/*/src/**/*.rs"
       pattern: '#\[cfg\(test\)\]'
       job: "test"
-      run: "cargo test --workspace"
+      run: "cargo test --workspace --locked"
     integration:
       # Cargo integration tests: kernel's public API from outside the crate
       # (positive, negative, boundary) and the kernel-std adapter driving the
@@ -61,24 +61,34 @@ release:
         - "crates/*/tests/*.rs"
       pattern: '#\[test\]'
       job: "test"
-      run: "cargo test --workspace"
+      run: "cargo test --workspace --locked"
     # No test covers the three levels below yet; each gap is tracked by its
-    # own issue. A test landing under these paths, run by a workflow job,
-    # closes the gap.
+    # own issue. Each level names a dedicated job and a test marker, so a
+    # file under these paths closes the gap only when a job of that name
+    # runs it: without `job`, the gate's default runner keywords would let
+    # the `test` job above (`cargo test`) cover e2e, although Cargo never
+    # builds a root-level tests/ directory. Add `run` with the job's command
+    # when the job lands.
     e2e:
       # Gap: issue 41 (daemon API flow, after P4 and P5).
       paths:
         - "tests/e2e/**"
+      pattern: '#\[(tokio::)?test\]|\btest\('
+      job: "e2e"
     load_soak:
       # Gap: issue 42 (sustained telemetry ingress with asserted bounds).
       paths:
         - "tests/load/**"
         - "tests/soak/**"
+      pattern: '#\[(tokio::)?test\]'
+      job: "load-soak"
     recovery_restore:
       # Gap: issue 43 (daemon restart and crash recovery, after P4).
       paths:
         - "tests/recovery/**"
         - "tests/restore/**"
+      pattern: '#\[(tokio::)?test\]'
+      job: "recovery-restore"
 exceptions:
   - rule: HISS-11
     path: .github/workflows/release.yml
