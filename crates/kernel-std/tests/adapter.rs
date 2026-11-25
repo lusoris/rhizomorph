@@ -67,6 +67,39 @@ fn adapter_forwards_operations_and_cov_events() {
     );
 }
 
+/// A lease counts the distinct points it commands and becomes unknown after revocation.
+#[test]
+fn lease_point_count_counts_zero_one_and_two_points() {
+    let shared = SharedKernel::new(Capacities {
+        points: 8,
+        leases: 4,
+        points_per_lease: 4,
+    });
+    let first = shared.register_output(Value::I64(0)).unwrap();
+    let second = shared.register_output(Value::I64(0)).unwrap();
+    let lease = shared.issue_lease(Millis(60_000)).unwrap();
+    assert_eq!(shared.lease_point_count(lease).unwrap(), 0);
+
+    let priority = Priority::MANUAL_OPERATOR;
+    shared
+        .command(lease, first, priority, Value::I64(1), &mut |_| {})
+        .unwrap();
+    assert_eq!(shared.lease_point_count(lease).unwrap(), 1);
+    shared
+        .command(lease, second, priority, Value::I64(1), &mut |_| {})
+        .unwrap();
+    assert_eq!(shared.lease_point_count(lease).unwrap(), 2);
+
+    shared.revoke(lease, &mut |_| {}).unwrap();
+    assert_eq!(
+        shared.lease_point_count(lease),
+        Err(AdapterError::Kernel {
+            op: "lease_point_count",
+            source: KernelError::UnknownLease,
+        })
+    );
+}
+
 /// Asserts that `res` is `AdapterError::Poisoned` for `expected_op`.
 #[expect(
     clippy::needless_pass_by_value,

@@ -3,9 +3,9 @@
 """Replay positive, negative, and boundary fixtures for ``scripts/mutants-check.py``.
 
 Replays gate count floor/ceiling checks, outcome line counting, planted-leg
-bijection and empty-outcome verification, ``.cargo/mutants.toml`` validation,
+bijection and empty-outcome verification, Cargo config and runner-cap checks,
 ``/proc/<pid>/stat`` parsing and session cleanup error propagation, child
-subreaper and orphan reaping checks, ``CARGO_MUTANTS_*`` environment stripping,
+subreaper and orphan reaping checks, Cargo environment stripping,
 signal cancellation exit handling, and real Linux descendant cleanup.
 """
 
@@ -15,20 +15,25 @@ import contextlib
 import errno
 import importlib.util
 import io
+import json
 import os
 import select
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
-from typing import TypeVar
+from typing import BinaryIO, TypeVar
 from unittest import mock
+
+if sys.platform.startswith("linux"):
+    import resource
 
 T = TypeVar("T")
 
@@ -46,11 +51,28 @@ def load_mutants_check() -> ModuleType:
 
 
 MOD = load_mutants_check()
+CAPPED_CARGO_ARGS = (
+    f"additional_cargo_args = {json.dumps(['--locked', MOD.TEST_RUNNER_CAP_ARG])}\n"
+)
 EMPTY_FILES: dict[str, str] = {
     "caught.txt": "",
     "timeout.txt": "",
     "unviable.txt": "",
 }
+
+
+def address_space_skip_reason(
+    soft: int, hard: int, cap: int, *, infinity: int, needs_distinct_soft: bool
+) -> str | None:
+    """Explain when inherited RLIMIT_AS values prevent a meaningful capped run."""
+    if hard != infinity and hard < cap:
+        return f"prlimit cannot raise the inherited hard RLIMIT_AS of {hard} to {cap}"
+    if needs_distinct_soft and soft == cap:
+        return (
+            f"inherited soft RLIMIT_AS already equals {cap}, so a runner "
+            "that skips prlimit would still pass the canary"
+        )
+    return None
 
 
 def call_quiet(
@@ -62,6 +84,35 @@ def call_quiet(
     with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
         result = func(*args, **kwargs)
     return result, out_buf.getvalue(), err_buf.getvalue()
+
+
+@contextlib.contextmanager
+def temporary_address_space_limit(target: int) -> Iterator[None]:
+    """Set a test's soft RLIMIT_AS without changing its hard limit."""
+    original = resource.getrlimit(resource.RLIMIT_AS)
+    _, hard = original
+    soft = target if hard == resource.RLIM_INFINITY else min(target, hard)
+    resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
+    try:
+        yield
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, original)
+
+
+def skip_for_inherited_limits(
+    case: unittest.TestCase, *, needs_distinct_soft: bool
+) -> None:
+    """Skip ``case`` when the inherited RLIMIT_AS decides its capped run."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    reason = address_space_skip_reason(
+        soft,
+        hard,
+        MOD.TEST_RUNNER_CAP_BYTES,
+        infinity=resource.RLIM_INFINITY,
+        needs_distinct_soft=needs_distinct_soft,
+    )
+    if reason is not None:
+        case.skipTest(reason)
 
 
 def write_mutants_out(base_dir: Path, files: dict[str, str]) -> Path:
@@ -305,9 +356,8 @@ class ConfigAndArgvTests(unittest.TestCase):
     def test_load_config_valid(self) -> None:
         """Accept a valid ``mutants.toml`` with all supported keys."""
         toml_text = (
-            'additional_cargo_args = ["--locked"]\n'
-            "cap_lints = true\n"
-            'exclude_re = ["first_fn$", "second_fn$"]\n'
+            CAPPED_CARGO_ARGS
+            + 'cap_lints = true\nexclude_re = ["first_fn$", "second_fn$"]\n'
         )
         cfg, status, err_txt = self.load_toml_text(toml_text)
         self.assertEqual(status, 0)
@@ -316,8 +366,67 @@ class ConfigAndArgvTests(unittest.TestCase):
         if not isinstance(cfg, MOD.MutantsConfig):
             self.fail("expected MutantsConfig")
         self.assertTrue(cfg.cap_lints)
-        self.assertEqual(cfg.additional_cargo_args, ["--locked"])
+        self.assertEqual(
+            cfg.additional_cargo_args, ["--locked", MOD.TEST_RUNNER_CAP_ARG]
+        )
         self.assertEqual(len(cfg.exclude_re), 2)
+
+    def test_load_config_requires_exact_test_runner_cap(self) -> None:
+        """Reject a missing runner cap and a runner with a different limit."""
+        different_cap = MOD.TEST_RUNNER_CAP_ARG.replace(
+            "--as=4294967296", "--as=8589934592"
+        )
+        cases = (["--locked"], ["--locked", different_cap])
+        for idx in range(len(cases)):
+            cargo_args = json.dumps(cases[idx])
+            with self.subTest(additional_cargo_args=cases[idx]):
+                cfg, status, err_txt = self.load_toml_text(
+                    f'additional_cargo_args = {cargo_args}\nexclude_re = ["ok$"]\n'
+                )
+                self.assertEqual(status, 2)
+                self.assertIsNone(cfg)
+                self.assertIn("lacks the test runner memory cap", err_txt)
+                if different_cap in cases[idx]:
+                    self.assertIn("unsupported additional_cargo_args", err_txt)
+                    self.assertIn("--as=8589934592", err_txt)
+
+    def test_test_runner_cap_arg_is_unchanged(self) -> None:
+        """Match the exact argument stored in mutants.toml."""
+        self.assertEqual(
+            MOD.TEST_RUNNER_CAP_ARG,
+            """--config=target.'cfg(target_os = "linux")'.runner=["prlimit", "--as=4294967296"]""",
+        )
+
+    def test_load_config_rejects_cargo_args_outside_allow_list(self) -> None:
+        """Reject runner overrides and unrelated arguments alongside the cap."""
+        cases = ('--config=target.x86_64-unknown-linux-gnu.runner=["env"]', "--offline")
+        for idx in range(len(cases)):
+            arg = cases[idx]
+            with self.subTest(arg=arg):
+                cargo_args = json.dumps(["--locked", MOD.TEST_RUNNER_CAP_ARG, arg])
+                cfg, status, err_txt = self.load_toml_text(
+                    f'additional_cargo_args = {cargo_args}\nexclude_re = ["ok$"]\n'
+                )
+                self.assertIsNone(cfg)
+                self.assertEqual(status, 2)
+                self.assertIn("mutants.toml", err_txt)
+                self.assertIn(arg, err_txt)
+
+    def test_repository_config_has_test_runner_cap(self) -> None:
+        """Load the checkout config with its runner cap from a different directory."""
+        repo_root = Path(MOD.__file__).resolve().parent.parent
+        self.assertTrue(MOD.CONFIG_PATH.is_absolute())
+        self.assertEqual(MOD.CONFIG_PATH, repo_root / ".cargo/mutants.toml")
+        previous_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            os.chdir(tmp_dir)
+            try:
+                (cfg, status), _, err_txt = call_quiet(MOD.load_config, MOD.CONFIG_PATH)
+            finally:
+                os.chdir(previous_cwd)
+        self.assertEqual(status, 0, err_txt)
+        self.assertIsInstance(cfg, MOD.MutantsConfig)
+        self.assertIn(MOD.TEST_RUNNER_CAP_ARG, cfg.additional_cargo_args)
 
     def test_load_config_rejections(self) -> None:
         """Reject unknown keys, missing or empty exclusions, bad regex, and types."""
@@ -350,46 +459,72 @@ class ConfigAndArgvTests(unittest.TestCase):
         )
         for idx in range(len(cases)):
             toml_text, expected_status, expected_msg = cases[idx]
-            cfg, status, err_txt = self.load_toml_text(toml_text)
+            cfg, status, err_txt = self.load_toml_text(CAPPED_CARGO_ARGS + toml_text)
             self.assertIsNone(cfg)
             self.assertEqual(status, expected_status)
             self.assertIn(expected_msg, err_txt)
 
-    def test_build_planted_args_worker_bound(self) -> None:
-        """Verify ``build_planted_args`` has ``--jobs 1`` once and ends with ``-F``."""
+    def test_build_planted_args_preserves_worker_bound_and_runner_cap(self) -> None:
+        """Pass the cap as one argument, set ``--jobs 1`` once, and end with ``-F``."""
         compiled, _, _ = call_quiet(
             MOD.compile_exclusions, ["first_pat$", "last_pat$"], Path("fixture")
         )
         if compiled is None:
             raise AssertionError("expected compiled patterns")
-        config = MOD.MutantsConfig(compiled, ["--locked"], True)
+        config = MOD.MutantsConfig(
+            compiled, ["--locked", MOD.TEST_RUNNER_CAP_ARG], True
+        )
         args = MOD.build_planted_args(config, Path("planted-out"))
         self.assertEqual(args.count("--jobs"), 1)
         jobs_idx = args.index("--jobs")
         self.assertEqual(args[jobs_idx : jobs_idx + 2], ["--jobs", "1"])
+        self.assertIn(f"--cargo-arg={MOD.TEST_RUNNER_CAP_ARG}", args)
         self.assertEqual(args[-2:], ["-F", "last_pat$"])
 
-    def test_leg_environment_strips_cargo_mutants_vars(self) -> None:
-        """Drop ``CARGO_MUTANTS_*`` keys, keep the rest, leave the input unchanged."""
-        source = {
+    def test_common_args_select_both_packages(self) -> None:
+        """Select both packages for the gate and planted legs."""
+        self.assertEqual(MOD.COMMON_ARGS[:4], ("-p", "kernel", "-p", "kernel-std"))
+
+    def test_leg_environment_allow_list(self) -> None:
+        """Keep approved keys, report only sorted dropped names, and set the cap."""
+        kept = {
             "PATH": "/usr/bin",
+            "RUSTFLAGS": "-D warnings",
             "CARGO_HOME": "/tmp/cargo",
-            "CARGO_MUTANTS_OUTPUT": "/tmp/stale-out",
-            "CARGO_MUTANTS_JOBS": "16",
-            "CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT": "300",
-            "CARGO_MUTANTS_TRACE_LEVEL": "debug",
-            "CARGO_MUTANTS_EXTRA": "1",
+            "CARGO_INCREMENTAL": "0",
+            "CARGO_TERM_COLOR": "never",
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_HTTP_TIMEOUT": "30",
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_REGISTRIES_EXAMPLE_PROTOCOL": "sparse",
+            "CARGO_REGISTRY_DEFAULT": "example",
         }
-        snapshot = dict(source)
-        cleaned = MOD.leg_environment(source)
-        self.assertEqual(source, snapshot)
-        self.assertEqual(
-            cleaned,
-            {
-                "PATH": "/usr/bin",
-                "CARGO_HOME": "/tmp/cargo",
-            },
+        dropped = (
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
+            "CARGO_MUTANTS_JOBS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_TARGET",
+            "CARGO_ALIAS_MUTANTS",
+            "CARGO_TARGET_DIR",
+            "CARGO_SOURCE_EXAMPLE_REPLACE_WITH",
         )
+        marker = "RHIZOMORPH_MUTANTS_AS_CAP"
+        source = {**kept, **dict.fromkeys(dropped, "fixture-value"), marker: "1"}
+        snapshot = dict(source)
+        cleaned, _, err_txt = call_quiet(MOD.leg_environment, source)
+        self.assertEqual(source, snapshot)
+        self.assertEqual(cleaned, {**kept, marker: "4294967296"})
+        self.assertEqual(len(err_txt.splitlines()), 1)
+        self.assertEqual(
+            err_txt.split(": ")[-1].strip(), ", ".join(map(repr, sorted(dropped)))
+        )
+        self.assertNotIn("fixture-value", err_txt)
+
+    def test_leg_environment_adds_cap_to_empty_environment(self) -> None:
+        """Set the same marker when it is absent and leave stderr quiet."""
+        cleaned, _, err_txt = call_quiet(MOD.leg_environment, {})
+        self.assertEqual(cleaned, {"RHIZOMORPH_MUTANTS_AS_CAP": "4294967296"})
+        self.assertEqual(err_txt, "")
 
     def _invoke_gate_leg_capturing_dir(
         self, caught: int, unviable: int, leg_rc: int = 0
@@ -528,15 +663,17 @@ class ConfigAndArgvTests(unittest.TestCase):
         self.assertIn("caught mutants below the floor", err_txt)
 
     def test_run_leg_passes_sanitized_env_to_popen(self) -> None:
-        """Verify ``run_leg`` strips ``CARGO_MUTANTS_OUTPUT`` from ``Popen`` ``env``."""
+        """Start the leg subprocess at the repository root with a sanitized env."""
         MOD.CANCEL_SIGNALS.clear()
         fake_proc = mock.MagicMock()
         fake_proc.pid = 777
         fake_proc.wait.return_value = 0
+        runner_key = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER"
         env_overrides = {
             "CARGO_MUTANTS_OUTPUT": "/tmp/override",
             "CARGO_MUTANTS_JOBS": "9",
             "MUTANTS_CHECK_KEEP": "present",
+            runner_key: "test-runner-value",
         }
         with (
             mock.patch.dict(os.environ, env_overrides, clear=False),
@@ -548,11 +685,470 @@ class ConfigAndArgvTests(unittest.TestCase):
         ):
             rc, _, err_txt = call_quiet(MOD.run_leg, "gate", ["--output", "."], 5)
         self.assertEqual(rc, 0)
-        self.assertEqual(err_txt, "")
+        self.assertIn(runner_key, err_txt)
+        self.assertEqual(mock_popen.call_args.kwargs.get("cwd"), MOD.REPO_ROOT)
         popen_env = mock_popen.call_args.kwargs["env"]
         self.assertNotIn("CARGO_MUTANTS_OUTPUT", popen_env)
         self.assertNotIn("CARGO_MUTANTS_JOBS", popen_env)
+        self.assertNotIn(runner_key, popen_env)
         self.assertEqual(popen_env.get("MUTANTS_CHECK_KEEP"), "present")
+        self.assertEqual(popen_env.get("RHIZOMORPH_MUTANTS_AS_CAP"), "4294967296")
+
+
+class RepositoryCargoConfigTests(unittest.TestCase):
+    """Replay repository-local Cargo config validation through ``load_config``."""
+
+    def setUp(self) -> None:
+        """Create a temporary Cargo directory with a valid mutation config."""
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        self.cargo_dir = Path(tmp_dir.name) / ".cargo"
+        self.cargo_dir.mkdir()
+        self.mutants_config = self.cargo_dir / "mutants.toml"
+        self.mutants_config.write_text(
+            CAPPED_CARGO_ARGS + 'exclude_re = ["ok$"]\n', encoding="utf-8"
+        )
+
+    def assert_config_rejected(self, path: Path, message: str) -> None:
+        """Require status 2 and a diagnostic naming the offending file."""
+        (cfg, status), _, err_txt = call_quiet(MOD.load_config, self.mutants_config)
+        self.assertEqual(status, 2)
+        self.assertIsNone(cfg)
+        self.assertIn(str(path), err_txt)
+        self.assertIn(message, err_txt)
+
+    def assert_config_accepted(self) -> None:
+        """Require successful validation with no diagnostics."""
+        (cfg, status), _, err_txt = call_quiet(MOD.load_config, self.mutants_config)
+        self.assertEqual(status, 0, err_txt)
+        self.assertIsInstance(cfg, MOD.MutantsConfig)
+        self.assertEqual(err_txt, "")
+
+    def test_missing_cargo_config_passes(self) -> None:
+        """Accept a checkout with neither Cargo config filename."""
+        self.assert_config_accepted()
+
+    def test_dangling_cargo_config_passes(self) -> None:
+        """Treat a dangling Cargo config symlink as absent."""
+        (self.cargo_dir / "config.toml").symlink_to("missing.toml")
+        self.assert_config_accepted()
+
+    def test_cargo_config_accepts_term_and_profile(self) -> None:
+        """Accept unrelated Cargo configuration namespaces."""
+        (self.cargo_dir / "config.toml").write_text(
+            '[term]\ncolor = "never"\n[profile.dev]\ndebug = 0\n', encoding="utf-8"
+        )
+        self.assert_config_accepted()
+
+    def test_cargo_config_rejects_sorted_keys(self) -> None:
+        """Refuse a config that could change how Cargo invokes the tests."""
+        path = self.cargo_dir / "config.toml"
+        path.write_text(
+            '[unstable]\nfoo = true\n[build]\ntarget = "x"\n[alias]\nmutants = "test"\n',
+            encoding="utf-8",
+        )
+        self.assert_config_rejected(path, "alias, build, unstable")
+
+    def test_cargo_config_rejects_includes(self) -> None:
+        """Refuse both include forms and check the legacy config for includes."""
+        cases = (
+            ("config.toml", '[[include]]\npath = "extra.toml"\n'),
+            ("config.toml", 'include = "extra.toml"\n'),
+            ("config", '[[include]]\npath = "extra.toml"\n'),
+        )
+        for idx in range(len(cases)):
+            filename, content = cases[idx]
+            path = self.cargo_dir / filename
+            with self.subTest(filename=filename, content=content):
+                path.write_text(content, encoding="utf-8")
+                self.assert_config_rejected(path, "include")
+            path.unlink()
+
+    def test_cargo_config_rejects_path_env(self) -> None:
+        """Refuse both table and string PATH settings in Cargo's environment."""
+        cases = ('{ value = "/tools", force = true }', '"/tools"')
+        path = self.cargo_dir / "config.toml"
+        for idx in range(len(cases)):
+            value = cases[idx]
+            with self.subTest(value=value):
+                path.write_text(f"[env]\nPATH = {value}\n", encoding="utf-8")
+                self.assert_config_rejected(path, "env")
+
+    def test_cargo_config_rejects_unrelated_env_key(self) -> None:
+        """Refuse environment tables even when they leave PATH alone."""
+        cases = ('"info"', "1")
+        path = self.cargo_dir / "config.toml"
+        for idx in range(len(cases)):
+            value = cases[idx]
+            with self.subTest(value=value):
+                path.write_text(f"[env]\nRUST_LOG = {value}\n", encoding="utf-8")
+                self.assert_config_rejected(path, "env")
+
+    def test_cargo_config_rejects_malformed_tables(self) -> None:
+        """Refuse scalar values in place of environment and target tables."""
+        cases = (
+            ('env = "x"\n', "env"),
+            ('target = "x"\n', "target"),
+            ("[target]\nfoo = 1\n", "target"),
+        )
+        path = self.cargo_dir / "config.toml"
+        for idx in range(len(cases)):
+            content, key = cases[idx]
+            with self.subTest(key=key):
+                path.write_text(content, encoding="utf-8")
+                self.assert_config_rejected(path, key)
+
+    def test_cargo_config_rejects_target_triple_and_cfg_runners(self) -> None:
+        """Reject both forms of Cargo target runner."""
+        cases = (
+            (
+                "x86_64-unknown-linux-gnu",
+                '[target.x86_64-unknown-linux-gnu]\nrunner = ["env"]\n',
+            ),
+            ("cfg(unix)", "[target.'cfg(unix)']\nrunner = \"env\"\n"),
+        )
+        path = self.cargo_dir / "config.toml"
+        for idx in range(len(cases)):
+            target, content = cases[idx]
+            with self.subTest(target=target):
+                path.write_text(content, encoding="utf-8")
+                self.assert_config_rejected(path, "target")
+
+    def test_cargo_config_rejects_legacy_filename(self) -> None:
+        """Check the legacy file even when a benign config.toml also exists."""
+        (self.cargo_dir / "config.toml").write_text("[term]\n", encoding="utf-8")
+        path = self.cargo_dir / "config"
+        path.write_text(
+            '[target.x86_64-unknown-linux-gnu]\nrunner = ["env"]\n', encoding="utf-8"
+        )
+        self.assert_config_rejected(path, "target")
+
+    def test_cargo_config_rejects_invalid_toml(self) -> None:
+        """Fail closed on invalid syntax or encoding."""
+        path = self.cargo_dir / "config.toml"
+        path.write_text("[target\n", encoding="utf-8")
+        self.assert_config_rejected(path, "failed to read")
+        path.write_bytes(b"\xff")
+        self.assert_config_rejected(path, "failed to read")
+
+    def test_cargo_config_rejects_directory(self) -> None:
+        """Fail closed when the config path is a directory."""
+        path = self.cargo_dir / "config.toml"
+        path.mkdir()
+        self.assert_config_rejected(path, "not a regular file")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux FIFOs")
+    def test_config_fifos_are_rejected_without_a_writer(self) -> None:
+        """Refuse either config FIFO without waiting for a writer."""
+
+        def fifo_open_timed_out(_signum: int, _frame: object) -> None:
+            """Fail the fixture if opening the FIFO blocks."""
+            raise AssertionError("blocked opening a config FIFO without a writer")
+
+        previous = signal.signal(signal.SIGALRM, fifo_open_timed_out)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        self.addCleanup(signal.alarm, 0)
+        cargo_config = self.cargo_dir / "config.toml"
+        with self.subTest(path=cargo_config):
+            os.mkfifo(cargo_config, 0o600)
+            signal.alarm(2)
+            ok, _, err_txt = call_quiet(MOD.check_cargo_config, cargo_config)
+            signal.alarm(0)
+            self.assertFalse(ok)
+            self.assertIn(str(cargo_config), err_txt)
+            self.assertIn("not a regular file", err_txt)
+        with self.subTest(path=self.mutants_config):
+            self.mutants_config.unlink()
+            os.mkfifo(self.mutants_config, 0o600)
+            signal.alarm(2)
+            self.assert_config_rejected(self.mutants_config, "not a regular file")
+            signal.alarm(0)
+
+    def test_mutants_config_rejects_invalid_utf8(self) -> None:
+        """Report unreadable UTF-8 in mutants.toml as a configuration error."""
+        self.mutants_config.write_bytes(b"\xff")
+        self.assert_config_rejected(self.mutants_config, "failed to read")
+
+
+class AddressSpaceSkipReasonTests(unittest.TestCase):
+    """Check Cargo canary limit compatibility without reading process limits."""
+
+    def test_compatible_limits(self) -> None:
+        """Accept infinity, reachable hard limits, and distinguishable soft limits."""
+        cap = MOD.TEST_RUNNER_CAP_BYTES
+        infinity = -1
+        cases = (
+            (infinity, infinity, True),
+            (cap, infinity, False),
+            (cap + 1, infinity, True),
+            (cap - 1, cap, True),
+            (cap - 1, infinity, True),
+        )
+        for soft, hard, needs_distinct_soft in cases:
+            with self.subTest(
+                soft=soft, hard=hard, needs_distinct_soft=needs_distinct_soft
+            ):
+                self.assertIsNone(
+                    address_space_skip_reason(
+                        soft,
+                        hard,
+                        cap,
+                        infinity=infinity,
+                        needs_distinct_soft=needs_distinct_soft,
+                    )
+                )
+
+    def test_matching_soft_limit_requires_skip_for_home_runner(self) -> None:
+        """Reject a soft limit that masks a runner skipping the cap."""
+        cap = MOD.TEST_RUNNER_CAP_BYTES
+        infinity = -1
+        reason = address_space_skip_reason(
+            cap, infinity, cap, infinity=infinity, needs_distinct_soft=True
+        )
+        self.assertIn("inherited soft RLIMIT_AS", reason or "")
+
+    def test_hard_limit_below_cap_requires_skip_for_both_runners(self) -> None:
+        """Reject a finite hard limit below the requested cap for both runners."""
+        cap = MOD.TEST_RUNNER_CAP_BYTES
+        for needs_distinct_soft in (False, True):
+            with self.subTest(needs_distinct_soft=needs_distinct_soft):
+                reason = address_space_skip_reason(
+                    cap - 1,
+                    cap - 1,
+                    cap,
+                    infinity=-1,
+                    needs_distinct_soft=needs_distinct_soft,
+                )
+                self.assertIn("inherited hard RLIMIT_AS", reason or "")
+
+
+@unittest.skipUnless(
+    sys.platform.startswith("linux")
+    and all(shutil.which(tool) for tool in ("cargo", "rustc", "prlimit")),
+    "requires Linux with cargo, rustc, and prlimit on PATH",
+)
+class CargoRunnerCapTests(unittest.TestCase):
+    """Check the mutation cap canary against Cargo home runner configuration."""
+
+    def setUp(self) -> None:
+        """Use a fresh Cargo home and keep build artifacts in the ignored target tree."""
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        self.cargo_home = Path(tmp_dir.name)
+        self.env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("CARGO_", "GIT_"))
+            and key != "RHIZOMORPH_MUTANTS_AS_CAP"
+        }
+        self.env.update(
+            CARGO_HOME=tmp_dir.name,
+            CARGO_NET_OFFLINE="true",
+            CARGO_TARGET_DIR=str(MOD.REPO_ROOT / "target" / "mutants-cap-fixture"),
+        )
+
+    def run_canary(self, *, mutation_leg: bool) -> subprocess.CompletedProcess[str]:
+        """Build and run only the shared canary, optionally with the mutation cap."""
+        env = self.env.copy()
+        args = ["cargo", "test", "--locked", "-p", "kernel", "--test", "mutants_cap"]
+        if mutation_leg:
+            env["RHIZOMORPH_MUTANTS_AS_CAP"] = str(MOD.TEST_RUNNER_CAP_BYTES)
+            args.append(MOD.TEST_RUNNER_CAP_ARG)
+        args.extend(("--", "mutation_runner_sets_address_space_cap"))
+        return subprocess.run(
+            args,
+            cwd=MOD.REPO_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+
+    def test_home_runner_cannot_clear_cap_canary(self) -> None:
+        """Reject a host runner that skips the cap and clears the test environment."""
+        skip_for_inherited_limits(self, needs_distinct_soft=True)
+        version = subprocess.run(
+            ["rustc", "-vV"],
+            cwd=MOD.REPO_ROOT,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        host = version.stdout.partition("\nhost: ")[2].partition("\n")[0]
+        self.assertTrue(host, version.stdout)
+        (self.cargo_home / "config.toml").write_text(
+            f'[target.{host}]\nrunner = ["env", "-i"]\n', encoding="utf-8"
+        )
+        result = self.run_canary(mutation_leg=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("mutation_runner_sets_address_space_cap", result.stdout)
+        self.assertIn("mutation test binary must inherit RLIMIT_AS", result.stdout)
+
+    def test_mutation_leg_with_cap_runner_passes(self) -> None:
+        """Accept the configured prlimit runner when it applies the requested cap."""
+        skip_for_inherited_limits(self, needs_distinct_soft=False)
+        result = self.run_canary(mutation_leg=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "test mutation_runner_sets_address_space_cap ... ok", result.stdout
+        )
+
+    def test_unmarked_build_without_cap_passes(self) -> None:
+        """Allow plain Cargo tests without the mutation marker or runner cap."""
+        result = self.run_canary(mutation_leg=False)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "test mutation_runner_sets_address_space_cap ... ok", result.stdout
+        )
+
+
+class PrlimitTests(unittest.TestCase):
+    """Verify the executable on the leg's PATH enforces the cap."""
+
+    def test_real_prlimit_sets_cap(self) -> None:
+        """Accept util-linux prlimit when the Python child sees 4 GiB."""
+        prlimit = shutil.which("prlimit")
+        if not sys.platform.startswith("linux") or prlimit is None:
+            self.skipTest("requires Linux util-linux prlimit")
+        skip_for_inherited_limits(self, needs_distinct_soft=False)
+        env = {"PATH": f"{Path(prlimit).absolute().parent}{os.pathsep}{os.defpath}"}
+        ok, _, err_txt = call_quiet(MOD.check_prlimit, env)
+        self.assertTrue(ok, err_txt)
+        self.assertEqual(err_txt, "")
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and shutil.which("prlimit") is not None,
+        "requires Linux util-linux prlimit",
+    )
+    def test_fake_prlimit_forwards_without_setting_cap(self) -> None:
+        """Reject a PATH shim that execs the Python child without a limit."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shim = Path(tmp_dir) / "prlimit"
+            shim.write_text('#!/bin/sh\nshift\nexec "$@"\n', encoding="utf-8")
+            shim.chmod(0o755)
+            env = {"PATH": f"{tmp_dir}{os.pathsep}{os.defpath}"}
+            with temporary_address_space_limit(MOD.TEST_RUNNER_CAP_BYTES - 4096):
+                ok, _, err_txt = call_quiet(MOD.check_prlimit, env)
+        self.assertFalse(ok)
+        self.assertIn("prlimit preflight", err_txt)
+        self.assertIn("RLIMIT_AS", err_txt)
+
+    def test_prlimit_missing_from_path(self) -> None:
+        """Reject a PATH without prlimit."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ok, _, err_txt = call_quiet(MOD.check_prlimit, {"PATH": tmp_dir})
+        self.assertFalse(ok)
+        self.assertIn("prlimit preflight", err_txt)
+
+    def test_prlimit_uses_leg_environment_and_deadline(self) -> None:
+        """Pin the preflight argv, deadline, and session subprocess options."""
+        env = {"MUTANTS_CHECK_SENTINEL": "present"}
+        cmd = [
+            "prlimit",
+            "--as=4294967296",
+            sys.executable,
+            "-I",
+            "-c",
+            "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0])",
+        ]
+        proc = mock.Mock(pid=777)
+
+        def start(*_args: object, stdout: BinaryIO, **_kwargs: object) -> mock.Mock:
+            """Write the child output to the provided temporary file."""
+            self.assertGreaterEqual(stdout.fileno(), 0)
+            stdout.write(b"4294967296\n")
+            return proc
+
+        with (
+            mock.patch.object(MOD, "run_session", wraps=MOD.run_session) as session,
+            mock.patch.object(MOD.subprocess, "Popen", side_effect=start) as popen,
+            mock.patch.object(MOD, "wait_exited", return_value=True),
+            mock.patch.object(MOD, "reap_exited_leg", return_value=0),
+        ):
+            self.assertTrue(MOD.check_prlimit(env))
+        stdout = popen.call_args.kwargs["stdout"]
+        self.assertTrue(stdout.closed)
+        self.assertEqual(MOD.PRLIMIT_PREFLIGHT_SECONDS, 30)
+        session.assert_called_once_with(
+            "prlimit preflight", cmd, 30, env, stdout=stdout
+        )
+        popen.assert_called_once_with(
+            cmd,
+            start_new_session=True,
+            env=env,
+            cwd=MOD.REPO_ROOT,
+            stdout=stdout,
+        )
+
+    def test_prlimit_requires_cap_and_verified_success(self) -> None:
+        """Require the exact cap, a successful exit, and verified cleanup."""
+        cases = (
+            (0, b"4294967295\n", "did not report the expected RLIMIT_AS"),
+            (1, b"4294967296\n", "failed with exit 1"),
+            (None, b"4294967296\n", "failed to complete with verified cleanup"),
+        )
+        for idx in range(len(cases)):
+            rc, output, message = cases[idx]
+            with (
+                self.subTest(rc=rc, output=output),
+                mock.patch.object(
+                    MOD.tempfile, "TemporaryFile", return_value=io.BytesIO(output)
+                ),
+                mock.patch.object(MOD, "run_session", return_value=rc),
+            ):
+                ok, _, err_txt = call_quiet(MOD.check_prlimit, {})
+            self.assertFalse(ok)
+            self.assertIn("prlimit preflight", err_txt)
+            self.assertIn(message, err_txt)
+
+    def test_prlimit_rejects_oversized_output(self) -> None:
+        """Reject 100,000 bytes even when the output starts with the expected cap."""
+        cap = str(MOD.TEST_RUNNER_CAP_BYTES).encode("ascii")
+        output = io.BytesIO(cap.ljust(100_000, b" "))
+        with (
+            mock.patch.object(output, "read", wraps=output.read) as read,
+            mock.patch.object(MOD.tempfile, "TemporaryFile", return_value=output),
+            mock.patch.object(MOD, "run_session", return_value=0),
+        ):
+            ok, _, err_txt = call_quiet(MOD.check_prlimit, {})
+        read.assert_called_once_with(64)
+        self.assertFalse(ok)
+        self.assertIn("did not report the expected RLIMIT_AS", err_txt)
+
+    def test_main_enables_subreaper_before_preflight(self) -> None:
+        """Enable subreaping, pass the leg environment, and stop on preflight failure."""
+        config = MOD.MutantsConfig([], [], False)
+        env = {"PATH": os.defpath, "RHIZOMORPH_MUTANTS_AS_CAP": "4294967296"}
+        startup = mock.Mock()
+        with (
+            mock.patch.object(signal, "signal"),
+            mock.patch.object(MOD, "load_config", return_value=(config, 0)) as load,
+            mock.patch.object(MOD, "leg_environment", return_value=env) as mock_env,
+            mock.patch.object(MOD, "check_prlimit", return_value=False) as preflight,
+            mock.patch.object(MOD, "enable_subreaper", return_value=True) as subreaper,
+            mock.patch.object(MOD, "run_gate_leg", return_value=0) as gate,
+            mock.patch.object(MOD, "run_planted_leg", return_value=0) as planted,
+        ):
+            startup.attach_mock(load, "load")
+            startup.attach_mock(subreaper, "subreaper")
+            startup.attach_mock(preflight, "preflight")
+            rc, _, _ = call_quiet(MOD.main)
+        self.assertEqual(rc, 2)
+        mock_env.assert_called_once_with(os.environ)
+        self.assertEqual(
+            startup.mock_calls,
+            [
+                mock.call.load(MOD.CONFIG_PATH),
+                mock.call.subreaper(),
+                mock.call.preflight(env),
+            ],
+        )
+        gate.assert_not_called()
+        planted.assert_not_called()
 
 
 class ProcCleanupTests(unittest.TestCase):
@@ -812,11 +1408,13 @@ class SubreaperAndOrphanTests(unittest.TestCase):
         with (
             mock.patch.object(signal, "signal"),
             mock.patch.object(MOD, "load_config", return_value=(cfg, 0)),
+            mock.patch.object(MOD, "check_prlimit", return_value=True) as preflight,
             mock.patch.object(MOD, "enable_subreaper", return_value=False),
             mock.patch.object(MOD, "run_gate_leg") as mock_gate,
         ):
             rc, _, _ = call_quiet(MOD.main)
         self.assertEqual(rc, 1)
+        self.assertFalse(preflight.called, "preflight ran without a subreaper")
         mock_gate.assert_not_called()
 
     def test_reap_orphans_drain_and_kill_rounds(self) -> None:
@@ -1025,6 +1623,43 @@ class CancellationTests(unittest.TestCase):
         self.assertEqual(status, MOD.SIGNAL_EXIT_BASE + int(signal.SIGTERM))
         self.assertIn("cancelled by SIGTERM", err_txt)
 
+    def test_main_honours_cancel_when_preflight_fails(self) -> None:
+        """Prefer a cancellation exit over the preflight failure exit."""
+        config = MOD.MutantsConfig([], [], False)
+        MOD.CANCEL_SIGNALS.append(int(signal.SIGTERM))
+        with (
+            mock.patch.object(signal, "signal"),
+            mock.patch.object(MOD, "load_config", return_value=(config, 0)),
+            mock.patch.object(MOD, "check_prlimit", return_value=False),
+            mock.patch.object(MOD, "enable_subreaper", return_value=True) as subreaper,
+            mock.patch.object(MOD, "run_gate_leg") as gate,
+        ):
+            rc, _, err_txt = call_quiet(MOD.main)
+        self.assertEqual(rc, MOD.SIGNAL_EXIT_BASE + int(signal.SIGTERM))
+        self.assertIn("cancelled by SIGTERM", err_txt)
+        subreaper.assert_called_once_with()
+        gate.assert_not_called()
+
+    def test_main_catches_preflight_cancellation(self) -> None:
+        """Report a session cancellation from preflight and skip both legs."""
+        config = MOD.MutantsConfig([], [], False)
+        signum = int(signal.SIGTERM)
+        with (
+            mock.patch.object(signal, "signal"),
+            mock.patch.object(MOD, "load_config", return_value=(config, 0)),
+            mock.patch.object(MOD, "enable_subreaper", return_value=True),
+            mock.patch.object(
+                MOD, "check_prlimit", side_effect=MOD.LegCancelled(signum)
+            ),
+            mock.patch.object(MOD, "run_gate_leg") as gate,
+            mock.patch.object(MOD, "run_planted_leg") as planted,
+        ):
+            rc, _, err_txt = call_quiet(MOD.main)
+        self.assertEqual(rc, MOD.SIGNAL_EXIT_BASE + signum)
+        self.assertIn("cancelled by SIGTERM", err_txt)
+        gate.assert_not_called()
+        planted.assert_not_called()
+
     def test_main_honours_late_cancel_after_legs(self) -> None:
         """Return ``128 + signum`` if a signal arrives after ``run_leg`` returns."""
         compiled, _, _ = call_quiet(MOD.compile_exclusions, ["pat$"], Path("fixture"))
@@ -1035,19 +1670,6 @@ class CancellationTests(unittest.TestCase):
             MOD.CANCEL_SIGNALS.append(int(signal.SIGTERM))
             return 0
 
-        with (
-            mock.patch.object(signal, "signal"),
-            mock.patch.object(MOD, "load_config", return_value=(cfg, 0)),
-            mock.patch.object(MOD, "enable_subreaper", return_value=True),
-            mock.patch.object(MOD, "run_gate_leg", return_value=0),
-            mock.patch.object(MOD, "run_planted_leg", side_effect=cancel_in_planted),
-        ):
-            rc, _, err_txt = call_quiet(MOD.main)
-            self.assertEqual(rc, MOD.SIGNAL_EXIT_BASE + int(signal.SIGTERM))
-            self.assertIn("cancelled by SIGTERM", err_txt)
-
-        MOD.CANCEL_SIGNALS.clear()
-
         def cancel_in_gate() -> int:
             """Simulate ``SIGINT`` arriving after ``run_leg`` in ``run_gate_leg``."""
             MOD.CANCEL_SIGNALS.append(int(signal.SIGINT))
@@ -1056,14 +1678,24 @@ class CancellationTests(unittest.TestCase):
         with (
             mock.patch.object(signal, "signal"),
             mock.patch.object(MOD, "load_config", return_value=(cfg, 0)),
+            mock.patch.object(MOD, "check_prlimit", return_value=True),
             mock.patch.object(MOD, "enable_subreaper", return_value=True),
-            mock.patch.object(MOD, "run_gate_leg", side_effect=cancel_in_gate),
-            mock.patch.object(MOD, "run_planted_leg") as mock_planted,
+            mock.patch.object(MOD, "run_gate_leg", return_value=0) as gate,
+            mock.patch.object(
+                MOD, "run_planted_leg", side_effect=cancel_in_planted
+            ) as planted,
         ):
+            rc, _, err_txt = call_quiet(MOD.main)
+            self.assertEqual(rc, MOD.SIGNAL_EXIT_BASE + int(signal.SIGTERM))
+            self.assertIn("cancelled by SIGTERM", err_txt)
+
+            MOD.CANCEL_SIGNALS.clear()
+            gate.side_effect = cancel_in_gate
+            planted.reset_mock()
             rc, _, err_txt = call_quiet(MOD.main)
             self.assertEqual(rc, MOD.SIGNAL_EXIT_BASE + int(signal.SIGINT))
             self.assertIn("cancelled by SIGINT", err_txt)
-            mock_planted.assert_not_called()
+            planted.assert_not_called()
 
     def test_run_leg_raises_on_cleanup_or_deadline_cancel(self) -> None:
         """Raise ``LegCancelled`` when cancelled during cleanup or deadline stop."""
@@ -1169,7 +1801,6 @@ class RealDescendantCleanupTests(unittest.TestCase):
         self.fifo_path = self.base / "grandchild.fifo"
         self.ready_path = self.base / "ready.fifo"
         self.pid_file = self.base / "grandchild.pid"
-        self.stub_path = self.base / "cargo"
         os.mkfifo(self.fifo_path, 0o600)
         os.mkfifo(self.ready_path, 0o600)
         self.assertTrue(MOD.enable_subreaper())
@@ -1218,8 +1849,10 @@ class RealDescendantCleanupTests(unittest.TestCase):
             with contextlib.suppress(OSError):
                 os.close(fd)
 
-    def _write_cargo_stub(self, launcher_prefix: str, tail_cmd: str) -> None:
-        """Write an executable ``cargo`` shell stub spawning a FIFO-holding child."""
+    def _write_process_stub(
+        self, executable: str, launcher_prefix: str, tail_cmd: str
+    ) -> None:
+        """Write a shell stub spawning a FIFO-holding child."""
         quoted_pid = shlex.quote(str(self.pid_file))
         quoted_fifo = shlex.quote(str(self.fifo_path))
         quoted_ready = shlex.quote(str(self.ready_path))
@@ -1236,8 +1869,9 @@ class RealDescendantCleanupTests(unittest.TestCase):
             f"read -r _ < {quoted_ready}\n"
             f"{tail_cmd}\n"
         )
-        self.stub_path.write_text(script, encoding="utf-8")
-        os.chmod(self.stub_path, 0o755)
+        stub_path = self.base / executable
+        stub_path.write_text(script, encoding="utf-8")
+        stub_path.chmod(0o755)
 
     def _assert_fifo_byte_then_eof(self) -> None:
         """Verify the grandchild wrote one byte and every writer closed the FIFO."""
@@ -1251,7 +1885,7 @@ class RealDescendantCleanupTests(unittest.TestCase):
 
     def test_timeout_stops_real_descendant(self) -> None:
         """Stop a timed-out stub and verify its background grandchild reaches EOF."""
-        self._write_cargo_stub("", "exec sleep 60")
+        self._write_process_stub("cargo", "", "exec sleep 60")
         prepended_path = f"{self.base}{os.pathsep}{os.environ.get('PATH', '')}"
         with (
             mock.patch.dict(os.environ, {"PATH": prepended_path}),
@@ -1265,13 +1899,43 @@ class RealDescendantCleanupTests(unittest.TestCase):
     def test_exit_reaps_setsid_orphan_before_returning(self) -> None:
         """Kill and reap a ``setsid`` grandchild before returning exit code ``0``."""
         # Kills mutation reap_orphans -> return True, which keeps grandchild alive.
-        self._write_cargo_stub("setsid", "exit 0")
+        self._write_process_stub("cargo", "setsid", "exit 0")
         prepended_path = f"{self.base}{os.pathsep}{os.environ.get('PATH', '')}"
         with mock.patch.dict(os.environ, {"PATH": prepended_path}):
             rc, _, err_txt = call_quiet(MOD.run_leg, "gate", [], 5)
         self.assertEqual(rc, 0)
         self.assertEqual(err_txt, "")
         self._assert_fifo_byte_then_eof()
+
+    def _assert_descendant_reaped(self) -> None:
+        """Verify the recorded child PID is gone and its FIFO has reached EOF."""
+        pid = int(self.pid_file.read_text(encoding="utf-8"))
+        self.assertFalse(Path(f"/proc/{pid}").exists(), f"descendant {pid} remains")
+        self._assert_fifo_byte_then_eof()
+
+    def test_prlimit_timeout_reaps_descendant(self) -> None:
+        """Reject a timed-out prlimit and reap its background child before return."""
+        self._write_process_stub("prlimit", "", "exec sleep 4")
+        env = {"PATH": f"{self.base}{os.pathsep}{os.defpath}"}
+        with (
+            mock.patch.object(MOD, "PRLIMIT_PREFLIGHT_SECONDS", 2),
+            mock.patch.object(MOD, "TERMINATE_GRACE_SECONDS", 1),
+        ):
+            ok, _, err_txt = call_quiet(MOD.check_prlimit, env)
+        self._assert_descendant_reaped()
+        self.assertFalse(ok)
+        self.assertIn("prlimit preflight failed", err_txt)
+        self.assertIn("exceeded its 2s deadline", err_txt)
+
+    def test_prlimit_success_reaps_setsid_orphan(self) -> None:
+        """Accept the printed cap after reaping an orphan in a separate session."""
+        self._write_process_stub(
+            "prlimit", "setsid", f"printf '%s\\n' {MOD.TEST_RUNNER_CAP_BYTES}\nexit 0"
+        )
+        env = {"PATH": f"{self.base}{os.pathsep}{os.defpath}"}
+        ok, _, err_txt = call_quiet(MOD.check_prlimit, env)
+        self._assert_descendant_reaped()
+        self.assertTrue(ok, err_txt)
 
 
 if __name__ == "__main__":

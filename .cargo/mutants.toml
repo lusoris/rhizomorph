@@ -1,7 +1,14 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 
-additional_cargo_args = ["--locked"]
+additional_cargo_args = [
+    "--locked",
+    # Cap each mutant test binary at 4 GiB of address space to protect host memory
+    # from runaway recursion or allocation. A binary that aborts when it runs out
+    # of address space counts as caught. prlimit comes from util-linux, so this cap
+    # applies only on Linux. Other hosts run uncapped.
+    '''--config=target.'cfg(target_os = "linux")'.runner=["prlimit", "--as=4294967296"]''',
+]
 
 # CI sets RUSTFLAGS=-D warnings; without the cap a mutant that only adds a
 # warning (an unused parameter) counts as unviable instead of being tested.
