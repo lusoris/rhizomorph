@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""Run the kernel mutation gate and replay excluded equivalent mutants.
+"""Run the kernel and kernel-std mutation gate and replay excluded equivalent mutants.
 
-The gate leg runs ``cargo mutants`` with ``.cargo/mutants.toml`` and proves that
-every non-excluded kernel mutant that builds is caught by the test suite, and
-that the number of mutants that fail to build stays at or below a recorded
-ceiling. The planted leg replays only the ``exclude_re`` patterns with
-``--no-config`` and proves both that the gate fails when a mutant survives and
-that every exclusion still names exactly one surviving equivalent mutant. Linux
-only: the runner marks itself a child subreaper, strips ``CARGO_MUTANTS_*``
-environment overrides, kills session and reparented leftovers through pidfds,
-and fails closed unless ``waitpid(-1, WNOHANG)`` proves ``ECHILD``.
+The gate leg runs ``cargo mutants`` with ``.cargo/mutants.toml``, which must carry
+the test runner memory cap. The gate verifies that every non-excluded mutant in
+both packages that builds is caught by the test suite, and that the number of
+mutants that fail to build stays at or below a recorded ceiling. The planted leg
+replays only the ``exclude_re`` patterns with ``--no-config`` and proves both that
+the gate fails when a mutant survives and that every exclusion still names
+exactly one surviving equivalent mutant. The Linux-only runner marks itself a
+child subreaper, strips ``CARGO_MUTANTS_*`` environment overrides, kills session
+and reparented leftovers through pidfds, and fails closed unless
+``waitpid(-1, WNOHANG)`` proves ``ECHILD``.
 """
 
 from __future__ import annotations
@@ -33,13 +34,25 @@ from types import FrameType
 
 CONFIG_PATH = Path(".cargo/mutants.toml")
 ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
+# Required as one additional_cargo_args entry in .cargo/mutants.toml.
+TEST_RUNNER_CAP_ARG = """--config=target.'cfg(target_os = "linux")'.runner=["prlimit", "--as=4294967296"]"""
 # Arguments after ``cargo mutants`` shared by both legs. ``--jobs 1`` runs one
 # mutant build+test at a time as an explicit HISS-06 worker bound; the default
 # was measured at 1 worker (one ``start thread`` in ``mutants.out/debug.log`` on
 # ``cargo-mutants`` 27.1.0 on a 32-CPU host), so counts and timing are
 # unchanged, while the ``cargo-mutants`` jobserver caps compile tasks at the CPU
 # count.
-COMMON_ARGS = ("-p", "kernel", "--jobs", "1", "--no-shuffle", "--timeout", "120")
+COMMON_ARGS = (
+    "-p",
+    "kernel",
+    "-p",
+    "kernel-std",
+    "--jobs",
+    "1",
+    "--no-shuffle",
+    "--timeout",
+    "120",
+)
 CARGO_MUTANTS_ENV_PREFIX = "CARGO_MUTANTS_"
 # Leg + stop time must fit mutants job timeout-minutes in .github/workflows/rust.yml:
 # stop takes at most TERMINATE_GRACE_SECONDS + 2 * KILL_WAIT_SECONDS = 80 s (grace
@@ -80,15 +93,17 @@ SIGNAL_EXIT_BASE = 128
 EMPTY_OUTCOME_FILES = ("caught.txt", "timeout.txt", "unviable.txt")
 # cargo-mutants exit code when at least one mutant was missed.
 MISSED_EXIT_CODE = 2
-# Unviable gate mutants measured 2026-11-24 with cap_lints (68 without); raise it
-# only in a reviewed change.
-GATE_UNVIABLE_CEILING = 31
-# Caught gate mutants measured on CI 2026-11-24 at 3737b36 (143 tested, 31 unviable);
-# lower it only in a reviewed change.
-GATE_CAUGHT_FLOOR = 112
-# Gate mutants tested (caught + unviable), measured on CI 2026-11-24 at 3737b36
-# (112 caught, 31 unviable); lower it only in a reviewed change.
-GATE_MUTANTS_FLOOR = 143
+# Kernel on CI 2026-11-24 at 3737b36: 143 tested, 112 caught, 31 unviable with
+# cap_lints (68 unviable without). Kernel-std measured 2026-11-25 on 7e09af5:
+# 24 tested, 14 caught, 9 unviable. The new lease point count test catches the
+# remaining mutant.
+# Unviable gate mutants: 31 + 9. Raise it only in a reviewed change.
+GATE_UNVIABLE_CEILING = 40
+# Caught gate mutants: 112 + 15. Lower it only in a reviewed change.
+GATE_CAUGHT_FLOOR = 127
+# Gate mutants tested (caught + unviable): 143 + 24.
+# Lower it only in a reviewed change.
+GATE_MUTANTS_FLOOR = 167
 
 
 @dataclass(frozen=True)
@@ -226,7 +241,7 @@ def parse_exclusions(
 
 
 def load_config(path: Path) -> tuple[MutantsConfig | None, int]:
-    """Read ``.cargo/mutants.toml`` and validate its keys and value types."""
+    """Validate the config keys, value types, and required test runner cap."""
     try:
         with path.open("rb") as handle:
             raw = tomllib.load(handle)
@@ -252,6 +267,12 @@ def load_config(path: Path) -> tuple[MutantsConfig | None, int]:
         raw.get("additional_cargo_args", []), "additional_cargo_args", path
     )
     if cargo_args is None:
+        return None, 2
+    if TEST_RUNNER_CAP_ARG not in cargo_args:
+        err(
+            f"additional_cargo_args in {path} lacks the test runner memory cap "
+            f"{TEST_RUNNER_CAP_ARG}"
+        )
         return None, 2
 
     exclusions, status = parse_exclusions(raw, path)

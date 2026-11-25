@@ -5,7 +5,8 @@
 # Rust workspace gate: runs workspace unit and integration tests, the
 # thumbv7em-none-eabihf no_std build of kernel, clippy lints, rustfmt check,
 # cargo-deny dependency licence verification (with planted negative check),
-# and cargo-mutants kernel mutation testing (with planted negative check).
+# and cargo-mutants kernel and kernel-std mutation testing (with planted
+# negative check).
 name: Rust
 
 'on':
@@ -177,9 +178,9 @@ jobs:
 
   mutants:
     name: mutants
-    # Linux only: kernel is no_std and holds no cfg(target_os), cfg(windows),
-    # cfg(unix), or cfg(target_family), so which mutants the tests catch does
-    # not depend on the host OS.
+    # kernel is no_std and has no cfg(target_os). The kernel-std tests have
+    # Linux-only /proc checks, so Linux runs the strictest variant. The test
+    # runner cap needs prlimit from util-linux on the Ubuntu runner.
     runs-on: ubuntu-26.04
     # Legs 900 s + 600 s, each plus up to 82 s stop and cleanup time
     # (scripts/mutants-check.py), = 1664 s; 30 min leaves room for setup steps.
@@ -209,7 +210,8 @@ jobs:
         uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c  # v2.90.8
         with:
           tool: cargo-mutants@27.1.0
-      - name: Run kernel mutation tests and replay the excluded mutants
+      # yamllint disable-line rule:line-length
+      - name: Run kernel and kernel-std mutation tests and replay the excluded mutants
         if: github.event.pull_request.draft != true
         # Process deadline for the script, its file and /proc reads included:
         # 28 min covers both legs plus 82 s per leg end (1664 s) and stays

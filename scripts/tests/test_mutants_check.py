@@ -15,6 +15,7 @@ import contextlib
 import errno
 import importlib.util
 import io
+import json
 import os
 import select
 import shlex
@@ -46,6 +47,9 @@ def load_mutants_check() -> ModuleType:
 
 
 MOD = load_mutants_check()
+CAPPED_CARGO_ARGS = (
+    f"additional_cargo_args = {json.dumps(['--locked', MOD.TEST_RUNNER_CAP_ARG])}\n"
+)
 EMPTY_FILES: dict[str, str] = {
     "caught.txt": "",
     "timeout.txt": "",
@@ -305,9 +309,8 @@ class ConfigAndArgvTests(unittest.TestCase):
     def test_load_config_valid(self) -> None:
         """Accept a valid ``mutants.toml`` with all supported keys."""
         toml_text = (
-            'additional_cargo_args = ["--locked"]\n'
-            "cap_lints = true\n"
-            'exclude_re = ["first_fn$", "second_fn$"]\n'
+            CAPPED_CARGO_ARGS
+            + 'cap_lints = true\nexclude_re = ["first_fn$", "second_fn$"]\n'
         )
         cfg, status, err_txt = self.load_toml_text(toml_text)
         self.assertEqual(status, 0)
@@ -316,8 +319,33 @@ class ConfigAndArgvTests(unittest.TestCase):
         if not isinstance(cfg, MOD.MutantsConfig):
             self.fail("expected MutantsConfig")
         self.assertTrue(cfg.cap_lints)
-        self.assertEqual(cfg.additional_cargo_args, ["--locked"])
+        self.assertEqual(
+            cfg.additional_cargo_args, ["--locked", MOD.TEST_RUNNER_CAP_ARG]
+        )
         self.assertEqual(len(cfg.exclude_re), 2)
+
+    def test_load_config_requires_exact_test_runner_cap(self) -> None:
+        """Reject a missing runner cap and a runner with a different limit."""
+        cases = (
+            'additional_cargo_args = ["--locked"]\n',
+            CAPPED_CARGO_ARGS.replace("--as=4294967296", "--as=8589934592"),
+        )
+        for idx in range(len(cases)):
+            with self.subTest(additional_cargo_args=cases[idx]):
+                cfg, status, err_txt = self.load_toml_text(
+                    cases[idx] + 'exclude_re = ["ok$"]\n'
+                )
+                self.assertEqual(status, 2)
+                self.assertIsNone(cfg)
+                self.assertIn("lacks the test runner memory cap", err_txt)
+
+    def test_repository_config_has_test_runner_cap(self) -> None:
+        """Load the checked-in config and confirm it carries the required cap."""
+        config_path = Path(__file__).resolve().parents[2] / ".cargo/mutants.toml"
+        (cfg, status), _, err_txt = call_quiet(MOD.load_config, config_path)
+        self.assertEqual(status, 0, err_txt)
+        self.assertIsInstance(cfg, MOD.MutantsConfig)
+        self.assertIn(MOD.TEST_RUNNER_CAP_ARG, cfg.additional_cargo_args)
 
     def test_load_config_rejections(self) -> None:
         """Reject unknown keys, missing or empty exclusions, bad regex, and types."""
@@ -350,24 +378,31 @@ class ConfigAndArgvTests(unittest.TestCase):
         )
         for idx in range(len(cases)):
             toml_text, expected_status, expected_msg = cases[idx]
-            cfg, status, err_txt = self.load_toml_text(toml_text)
+            cfg, status, err_txt = self.load_toml_text(CAPPED_CARGO_ARGS + toml_text)
             self.assertIsNone(cfg)
             self.assertEqual(status, expected_status)
             self.assertIn(expected_msg, err_txt)
 
-    def test_build_planted_args_worker_bound(self) -> None:
-        """Verify ``build_planted_args`` has ``--jobs 1`` once and ends with ``-F``."""
+    def test_build_planted_args_preserves_worker_bound_and_runner_cap(self) -> None:
+        """Pass the cap as one argument, set ``--jobs 1`` once, and end with ``-F``."""
         compiled, _, _ = call_quiet(
             MOD.compile_exclusions, ["first_pat$", "last_pat$"], Path("fixture")
         )
         if compiled is None:
             raise AssertionError("expected compiled patterns")
-        config = MOD.MutantsConfig(compiled, ["--locked"], True)
+        config = MOD.MutantsConfig(
+            compiled, ["--locked", MOD.TEST_RUNNER_CAP_ARG], True
+        )
         args = MOD.build_planted_args(config, Path("planted-out"))
         self.assertEqual(args.count("--jobs"), 1)
         jobs_idx = args.index("--jobs")
         self.assertEqual(args[jobs_idx : jobs_idx + 2], ["--jobs", "1"])
+        self.assertIn(f"--cargo-arg={MOD.TEST_RUNNER_CAP_ARG}", args)
         self.assertEqual(args[-2:], ["-F", "last_pat$"])
+
+    def test_common_args_select_both_packages(self) -> None:
+        """Select both packages for the gate and planted legs."""
+        self.assertEqual(MOD.COMMON_ARGS[:4], ("-p", "kernel", "-p", "kernel-std"))
 
     def test_leg_environment_strips_cargo_mutants_vars(self) -> None:
         """Drop ``CARGO_MUTANTS_*`` keys, keep the rest, leave the input unchanged."""
