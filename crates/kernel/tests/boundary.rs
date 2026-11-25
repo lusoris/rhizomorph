@@ -6,7 +6,7 @@
 use core::mem::size_of;
 use kernel::{
     AssetId, AssetRevision, Capacities, CapacityKind, CovEvent, Kernel, KernelError, LeaseId,
-    Millis, Priority, PriorityArray, Revision, RevisionError, Value, ValueKind,
+    Millis, PointId, Priority, PriorityArray, Revision, RevisionError, Value, ValueKind,
 };
 
 /// Exit check, boundary: `Priority` 1 and 16 are accepted and arbitrate.
@@ -432,4 +432,180 @@ fn revision_maximum_and_exhaustion() {
 fn revision_layouts_are_compact() {
     assert_eq!(size_of::<Option<Revision>>(), size_of::<u32>());
     assert_eq!(size_of::<AssetRevision>(), 8);
+}
+
+/// Exit check, boundary: `Millis::as_u64` returns `0` and `u64::MAX` unchanged.
+#[test]
+fn millis_as_u64_returns_zero_and_u64_max() {
+    assert_eq!(Millis::new(0).as_u64(), 0);
+    assert_eq!(Millis::new(u64::MAX).as_u64(), u64::MAX);
+}
+
+/// Exit check, boundary: `PointId::as_u32` returns `0` and `u32::MAX` unchanged.
+#[test]
+fn point_id_as_u32_returns_zero_and_u32_max() {
+    assert_eq!(PointId(0).as_u32(), 0);
+    assert_eq!(PointId(u32::MAX).as_u32(), u32::MAX);
+}
+
+/// Exit check, boundary: `LeaseId::as_u32` returns `0` and `u32::MAX` unchanged.
+#[test]
+fn lease_id_as_u32_returns_zero_and_u32_max() {
+    assert_eq!(LeaseId(0).as_u32(), 0);
+    assert_eq!(LeaseId(u32::MAX).as_u32(), u32::MAX);
+}
+
+/// Exit check, boundary: `Priority::get` returns `1` and `16` at the valid level bounds.
+#[test]
+fn priority_get_returns_one_and_sixteen_at_bounds() {
+    assert_eq!(Priority::new(1).unwrap().get(), 1);
+    assert_eq!(Priority::new(16).unwrap().get(), 16);
+    assert_eq!(Priority::MANUAL_LIFE_SAFETY.get(), 1);
+    assert_eq!(Priority::FALLBACK.get(), 16);
+}
+
+/// Exit check, boundary: `CapacityKind` formats every variant to its exact name.
+#[test]
+fn capacity_kind_display_matches_exact_names() {
+    assert_eq!(CapacityKind::Points.to_string(), "points");
+    assert_eq!(CapacityKind::Leases.to_string(), "leases");
+    assert_eq!(CapacityKind::PointsPerLease.to_string(), "points_per_lease");
+}
+
+/// Exit check, boundary: `KernelError` formats every variant and capacity kind to its exact text.
+#[test]
+fn kernel_error_display_matches_exact_messages() {
+    let cases = [
+        (KernelError::UnknownPoint, "unknown point id"),
+        (
+            KernelError::WrongPointType,
+            "wrong point type for operation",
+        ),
+        (
+            KernelError::KindMismatch,
+            "value kind does not match point kind",
+        ),
+        (
+            KernelError::NonFinite,
+            "non-finite floating-point value refused",
+        ),
+        (
+            KernelError::InvalidPriority,
+            "priority level must be in 1..=16",
+        ),
+        (
+            KernelError::ReservedPriority,
+            "priority level 6 is reserved for kernel use",
+        ),
+        (KernelError::UnknownLease, "unknown or revoked lease id"),
+        (KernelError::LeaseExpired, "lease has expired"),
+        (
+            KernelError::SlotNotHeld,
+            "priority slot is not held by caller lease",
+        ),
+        (
+            KernelError::InvalidDeadband,
+            "invalid deadband configuration",
+        ),
+        (KernelError::InvalidTtl, "invalid or overflowing lease ttl"),
+        (
+            KernelError::CapacityExceeded(CapacityKind::Points),
+            "capacity exceeded: points",
+        ),
+        (
+            KernelError::CapacityExceeded(CapacityKind::Leases),
+            "capacity exceeded: leases",
+        ),
+        (
+            KernelError::CapacityExceeded(CapacityKind::PointsPerLease),
+            "capacity exceeded: points_per_lease",
+        ),
+        (
+            KernelError::LeaseIdsExhausted,
+            "lease id counter exhausted at u32::MAX",
+        ),
+    ];
+    for (err, expected) in cases {
+        assert_eq!(err.to_string(), expected);
+    }
+}
+
+/// Exit check, boundary: `u16` deadbands fire at exact or fractional thresholds and drop below.
+#[test]
+fn u16_deadband_fires_at_threshold_and_drops_below() {
+    let mut k = Kernel::new(Capacities::default());
+    let exact_pt = k.register_input(ValueKind::U16, Some(5.0)).unwrap();
+    let frac_pt = k.register_input(ValueKind::U16, Some(2.5)).unwrap();
+    let mut events = Vec::new();
+
+    k.telemetry(exact_pt, Value::U16(10), &mut |e| events.push(e))
+        .unwrap();
+    k.telemetry(exact_pt, Value::U16(14), &mut |e| events.push(e))
+        .unwrap();
+    assert_eq!(k.present_value(exact_pt).unwrap(), Some(Value::U16(14)));
+    assert_eq!(events.len(), 1);
+    k.telemetry(exact_pt, Value::U16(15), &mut |e| events.push(e))
+        .unwrap();
+
+    k.telemetry(frac_pt, Value::U16(10), &mut |e| events.push(e))
+        .unwrap();
+    k.telemetry(frac_pt, Value::U16(12), &mut |e| events.push(e))
+        .unwrap();
+    assert_eq!(k.present_value(frac_pt).unwrap(), Some(Value::U16(12)));
+    assert_eq!(events.len(), 3);
+    k.telemetry(frac_pt, Value::U16(13), &mut |e| events.push(e))
+        .unwrap();
+
+    assert_eq!(
+        events,
+        vec![
+            CovEvent {
+                point: exact_pt,
+                value: Value::U16(10),
+            },
+            CovEvent {
+                point: exact_pt,
+                value: Value::U16(15),
+            },
+            CovEvent {
+                point: frac_pt,
+                value: Value::U16(10),
+            },
+            CovEvent {
+                point: frac_pt,
+                value: Value::U16(13),
+            },
+        ]
+    );
+}
+
+/// Exit check, boundary: an `i64` fractional deadband drops diff `2` and fires at diff `3`.
+#[test]
+fn i64_fractional_deadband_fires_at_ceiling_and_drops_floor() {
+    let mut k = Kernel::new(Capacities::default());
+    let signed_pt = k.register_input(ValueKind::I64, Some(2.5)).unwrap();
+    let mut events = Vec::new();
+
+    k.telemetry(signed_pt, Value::I64(10), &mut |e| events.push(e))
+        .unwrap();
+    k.telemetry(signed_pt, Value::I64(12), &mut |e| events.push(e))
+        .unwrap();
+    assert_eq!(k.present_value(signed_pt).unwrap(), Some(Value::I64(12)));
+    assert_eq!(events.len(), 1);
+
+    k.telemetry(signed_pt, Value::I64(13), &mut |e| events.push(e))
+        .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            CovEvent {
+                point: signed_pt,
+                value: Value::I64(10),
+            },
+            CovEvent {
+                point: signed_pt,
+                value: Value::I64(13),
+            },
+        ]
+    );
 }
