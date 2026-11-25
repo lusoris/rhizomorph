@@ -19,6 +19,7 @@ import json
 import os
 import select
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -799,12 +800,20 @@ class RepositoryCargoConfigTests(unittest.TestCase):
 class PrlimitTests(unittest.TestCase):
     """Verify the executable on the leg's PATH enforces the cap."""
 
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and shutil.which("prlimit") is not None,
+        "requires Linux util-linux prlimit",
+    )
     def test_real_prlimit_sets_cap(self) -> None:
         """Accept util-linux prlimit when the Python child sees 4 GiB."""
         ok, _, err_txt = call_quiet(MOD.check_prlimit, {"PATH": os.defpath})
         self.assertTrue(ok, err_txt)
         self.assertEqual(err_txt, "")
 
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and shutil.which("prlimit") is not None,
+        "requires Linux util-linux prlimit",
+    )
     def test_fake_prlimit_forwards_without_setting_cap(self) -> None:
         """Reject a PATH shim that execs the Python child without a limit."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -833,6 +842,32 @@ class PrlimitTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("prlimit preflight", err_txt)
         self.assertIn("timed out", err_txt)
+
+    def test_prlimit_uses_leg_environment_and_deadline(self) -> None:
+        """Verify the preflight command, environment, working directory, and deadline."""
+        env = {"MUTANTS_CHECK_SENTINEL": "present"}
+        cmd = [
+            "prlimit",
+            "--as=4294967296",
+            sys.executable,
+            "-I",
+            "-c",
+            "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0])",
+        ]
+        with mock.patch.object(
+            MOD.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(cmd, 0, b"4294967296\n"),
+        ) as run:
+            self.assertTrue(MOD.check_prlimit(env))
+        run.assert_called_once_with(
+            cmd,
+            check=False,
+            env=env,
+            cwd=MOD.REPO_ROOT,
+            capture_output=True,
+            timeout=30,
+        )
 
     def test_prlimit_rejects_wrong_output_or_nonzero_exit(self) -> None:
         """Require an exact cap reading as well as a successful exit."""
