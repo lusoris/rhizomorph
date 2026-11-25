@@ -168,7 +168,7 @@ jobs:
       - name: Install cargo-deny
         if: github.event.pull_request.draft != true
         # yamllint disable-line rule:line-length
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c  # v2.90.8
         with:
           tool: cargo-deny@0.21.0
       - name: Verify dependency licences
@@ -206,7 +206,7 @@ jobs:
       - name: Install cargo-mutants
         if: github.event.pull_request.draft != true
         # yamllint disable-line rule:line-length
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c  # v2.90.8
         with:
           tool: cargo-mutants@27.1.0
       - name: Run kernel mutation tests and replay the excluded mutants
