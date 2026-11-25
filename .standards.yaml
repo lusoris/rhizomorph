@@ -40,6 +40,57 @@ register:
         kind: message
         format: json
         selector: invariants.*
+release:
+  # Binds the release test levels the app-service profile requires to the
+  # tests that run them. The `test` job in .github/workflows/rust.yml runs
+  # `cargo test --workspace --locked`, which builds and runs both the in-crate
+  # unit tests and the Cargo integration tests under crates/*/tests/.
+  test_levels:
+    unit:
+      # In-crate `#[cfg(test)]` modules next to the code they test; the
+      # pattern needs a test function (`#[test]`, `#[tokio::test]`, ...)
+      # after the module attribute, so an empty test module does not count.
+      paths:
+        - "crates/*/src/**/*.rs"
+      pattern: '(?ms)^\s*#\[cfg\(test\)\].*^\s*#\[(?:\w+::)*test\b[^\]]*\]'
+      job: "test"
+      run: "cargo test --workspace --locked"
+    integration:
+      # Cargo integration tests: kernel's public API from outside the crate
+      # (positive, negative, boundary) and the kernel-std adapter driving the
+      # kernel across the crate boundary and across threads.
+      paths:
+        - "crates/*/tests/*.rs"
+      pattern: '(?m)^\s*#\[(?:\w+::)*test\b[^\]]*\]'
+      job: "test"
+      run: "cargo test --workspace --locked"
+    # No test covers the three levels below yet; each gap is tracked by its
+    # own issue. Each level names a dedicated job and a test marker, so a
+    # file under these paths closes the gap only when a job of that name
+    # runs it: without `job`, the gate's default runner keywords would let
+    # the `test` job above (`cargo test`) cover e2e, although Cargo never
+    # builds a root-level tests/ directory. Add `run` with the job's command
+    # when the job lands.
+    e2e:
+      # Gap: issue 41 (daemon API flow, after P4 and P5).
+      paths:
+        - "tests/e2e/**"
+      pattern: '(?m)^\s*#\[(?:\w+::)*test\b[^\]]*\]|\btest\('
+      job: "e2e"
+    load_soak:
+      # Gap: issue 42 (sustained telemetry ingress with asserted bounds).
+      paths:
+        - "tests/load/**"
+        - "tests/soak/**"
+      pattern: '(?m)^\s*#\[(?:\w+::)*test\b[^\]]*\]'
+      job: "load-soak"
+    recovery_restore:
+      # Gap: issue 43 (daemon restart and crash recovery, after P4).
+      paths:
+        - "tests/recovery/**"
+        - "tests/restore/**"
+      pattern: '(?m)^\s*#\[(?:\w+::)*test\b[^\]]*\]'
+      job: "recovery-restore"
 exceptions:
   - rule: HISS-11
     path: .github/workflows/release.yml
