@@ -61,6 +61,20 @@ EMPTY_FILES: dict[str, str] = {
 }
 
 
+def address_space_skip_reason(
+    soft: int, hard: int, cap: int, *, infinity: int, needs_distinct_soft: bool
+) -> str | None:
+    """Explain when inherited RLIMIT_AS values prevent a meaningful capped run."""
+    if hard != infinity and hard < cap:
+        return f"prlimit cannot raise the inherited hard RLIMIT_AS of {hard} to {cap}"
+    if needs_distinct_soft and soft == cap:
+        return (
+            f"inherited soft RLIMIT_AS already equals {cap}, so a runner "
+            "that skips prlimit would still pass the canary"
+        )
+    return None
+
+
 def call_quiet(
     func: Callable[..., T], *args: object, **kwargs: object
 ) -> tuple[T, str, str]:
@@ -83,6 +97,22 @@ def temporary_address_space_limit(target: int) -> Iterator[None]:
         yield
     finally:
         resource.setrlimit(resource.RLIMIT_AS, original)
+
+
+def skip_for_inherited_limits(
+    case: unittest.TestCase, *, needs_distinct_soft: bool
+) -> None:
+    """Skip ``case`` when the inherited RLIMIT_AS decides its capped run."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    reason = address_space_skip_reason(
+        soft,
+        hard,
+        MOD.TEST_RUNNER_CAP_BYTES,
+        infinity=resource.RLIM_INFINITY,
+        needs_distinct_soft=needs_distinct_soft,
+    )
+    if reason is not None:
+        case.skipTest(reason)
 
 
 def write_mutants_out(base_dir: Path, files: dict[str, str]) -> Path:
@@ -840,6 +870,58 @@ class RepositoryCargoConfigTests(unittest.TestCase):
         self.assert_config_rejected(self.mutants_config, "failed to read")
 
 
+class AddressSpaceSkipReasonTests(unittest.TestCase):
+    """Check Cargo canary limit compatibility without reading process limits."""
+
+    def test_compatible_limits(self) -> None:
+        """Accept infinity, reachable hard limits, and distinguishable soft limits."""
+        cap = MOD.TEST_RUNNER_CAP_BYTES
+        infinity = -1
+        cases = (
+            (infinity, infinity, True),
+            (cap, infinity, False),
+            (cap + 1, infinity, True),
+            (cap - 1, cap, True),
+            (cap - 1, infinity, True),
+        )
+        for soft, hard, needs_distinct_soft in cases:
+            with self.subTest(
+                soft=soft, hard=hard, needs_distinct_soft=needs_distinct_soft
+            ):
+                self.assertIsNone(
+                    address_space_skip_reason(
+                        soft,
+                        hard,
+                        cap,
+                        infinity=infinity,
+                        needs_distinct_soft=needs_distinct_soft,
+                    )
+                )
+
+    def test_matching_soft_limit_requires_skip_for_home_runner(self) -> None:
+        """Reject a soft limit that masks a runner skipping the cap."""
+        cap = MOD.TEST_RUNNER_CAP_BYTES
+        infinity = -1
+        reason = address_space_skip_reason(
+            cap, infinity, cap, infinity=infinity, needs_distinct_soft=True
+        )
+        self.assertIn("inherited soft RLIMIT_AS", reason or "")
+
+    def test_hard_limit_below_cap_requires_skip_for_both_runners(self) -> None:
+        """Reject a finite hard limit below the requested cap for both runners."""
+        cap = MOD.TEST_RUNNER_CAP_BYTES
+        for needs_distinct_soft in (False, True):
+            with self.subTest(needs_distinct_soft=needs_distinct_soft):
+                reason = address_space_skip_reason(
+                    cap - 1,
+                    cap - 1,
+                    cap,
+                    infinity=-1,
+                    needs_distinct_soft=needs_distinct_soft,
+                )
+                self.assertIn("inherited hard RLIMIT_AS", reason or "")
+
+
 @unittest.skipUnless(
     sys.platform.startswith("linux")
     and all(shutil.which(tool) for tool in ("cargo", "rustc", "prlimit")),
@@ -886,6 +968,7 @@ class CargoRunnerCapTests(unittest.TestCase):
 
     def test_home_runner_cannot_clear_cap_canary(self) -> None:
         """Reject a host runner that skips the cap and clears the test environment."""
+        skip_for_inherited_limits(self, needs_distinct_soft=True)
         version = subprocess.run(
             ["rustc", "-vV"],
             cwd=MOD.REPO_ROOT,
@@ -907,6 +990,7 @@ class CargoRunnerCapTests(unittest.TestCase):
 
     def test_mutation_leg_with_cap_runner_passes(self) -> None:
         """Accept the configured prlimit runner when it applies the requested cap."""
+        skip_for_inherited_limits(self, needs_distinct_soft=False)
         result = self.run_canary(mutation_leg=True)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
@@ -930,6 +1014,7 @@ class PrlimitTests(unittest.TestCase):
         prlimit = shutil.which("prlimit")
         if not sys.platform.startswith("linux") or prlimit is None:
             self.skipTest("requires Linux util-linux prlimit")
+        skip_for_inherited_limits(self, needs_distinct_soft=False)
         env = {"PATH": f"{Path(prlimit).absolute().parent}{os.pathsep}{os.defpath}"}
         ok, _, err_txt = call_quiet(MOD.check_prlimit, env)
         self.assertTrue(ok, err_txt)
