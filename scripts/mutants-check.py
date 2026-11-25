@@ -10,9 +10,9 @@ mutants that fail to build stays at or below a recorded ceiling. The planted leg
 replays only the ``exclude_re`` patterns with ``--no-config`` and proves both that
 the gate fails when a mutant survives and that every exclusion still names
 exactly one surviving equivalent mutant. The Linux-only runner marks itself a
-child subreaper, strips ``CARGO_MUTANTS_*`` environment overrides, kills session
-and reparented leftovers through pidfds, and fails closed unless
-``waitpid(-1, WNOHANG)`` proves ``ECHILD``.
+child subreaper, strips ``CARGO_MUTANTS_*`` and ``CARGO_TARGET_*_RUNNER``
+environment overrides, kills session and reparented leftovers through pidfds,
+and fails closed unless ``waitpid(-1, WNOHANG)`` proves ``ECHILD``.
 """
 
 from __future__ import annotations
@@ -36,6 +36,9 @@ CONFIG_PATH = Path(".cargo/mutants.toml")
 ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
 # Required as one additional_cargo_args entry in .cargo/mutants.toml.
 TEST_RUNNER_CAP_ARG = """--config=target.'cfg(target_os = "linux")'.runner=["prlimit", "--as=4294967296"]"""
+# Each element is forwarded to Cargo. Another --config argument could set a target
+# runner that overrides the cap, so adding an element here requires review.
+ALLOWED_CARGO_ARGS = ("--locked", TEST_RUNNER_CAP_ARG)
 # Arguments after ``cargo mutants`` shared by both legs. ``--jobs 1`` runs one
 # mutant build+test at a time as an explicit HISS-06 worker bound; the default
 # was measured at 1 worker (one ``start thread`` in ``mutants.out/debug.log`` on
@@ -181,13 +184,18 @@ def enable_subreaper() -> bool:
 
 
 def leg_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    """Return a copy of ``environ`` without ``CARGO_MUTANTS_*`` overrides."""
+    """Return a copy without cargo-mutants overrides or per-target Cargo runners."""
     keys = list(environ.keys())
     cleaned: dict[str, str] = {}
+    runner_keys: list[str] = []
     for idx in range(len(keys)):
         key = keys[idx]
-        if not key.startswith(CARGO_MUTANTS_ENV_PREFIX):
+        if key.startswith("CARGO_TARGET_") and key.endswith("_RUNNER"):
+            runner_keys.append(repr(key))
+        elif not key.startswith(CARGO_MUTANTS_ENV_PREFIX):
             cleaned[key] = environ[key]
+    if runner_keys:
+        err(f"dropped Cargo runner environment keys: {', '.join(sorted(runner_keys))}")
     return cleaned
 
 
@@ -240,8 +248,33 @@ def parse_exclusions(
     return compiled, 0
 
 
+def check_cargo_config(path: Path) -> bool:
+    """Accept a missing or readable Cargo config without target runners."""
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        err(f"failed to read {path}: {exc}")
+        return False
+
+    targets = raw.get("target")
+    if not isinstance(targets, dict):
+        return True
+    keys = list(targets)
+    for idx in range(len(keys)):
+        key = keys[idx]
+        target = targets[key]
+        # A runner here can override or conflict with the test runner memory cap.
+        if isinstance(target, dict) and "runner" in target:
+            err(f"runner for target {key!r} in {path} can override the memory cap")
+            return False
+    return True
+
+
 def load_config(path: Path) -> tuple[MutantsConfig | None, int]:
-    """Validate the config keys, value types, and required test runner cap."""
+    """Validate mutation settings and guard the test runner cap."""
     try:
         with path.open("rb") as handle:
             raw = tomllib.load(handle)
@@ -268,16 +301,28 @@ def load_config(path: Path) -> tuple[MutantsConfig | None, int]:
     )
     if cargo_args is None:
         return None, 2
-    if TEST_RUNNER_CAP_ARG not in cargo_args:
+    has_runner_cap = TEST_RUNNER_CAP_ARG in cargo_args
+    if not has_runner_cap:
         err(
             f"additional_cargo_args in {path} lacks the test runner memory cap "
             f"{TEST_RUNNER_CAP_ARG}"
         )
+    unsupported: list[str] = []
+    for idx in range(len(cargo_args)):
+        if cargo_args[idx] not in ALLOWED_CARGO_ARGS:
+            unsupported.append(repr(cargo_args[idx]))
+    if unsupported:
+        err(f"unsupported additional_cargo_args in {path}: {', '.join(unsupported)}")
+    if not has_runner_cap or unsupported:
         return None, 2
 
     exclusions, status = parse_exclusions(raw, path)
     if exclusions is None:
         return None, status
+    cargo_config_names = ("config.toml", "config")
+    for idx in range(len(cargo_config_names)):
+        if not check_cargo_config(path.parent / cargo_config_names[idx]):
+            return None, 2
     return MutantsConfig(exclusions, cargo_args, cap_lints), 0
 
 

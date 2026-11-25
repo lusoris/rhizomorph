@@ -3,9 +3,9 @@
 """Replay positive, negative, and boundary fixtures for ``scripts/mutants-check.py``.
 
 Replays gate count floor/ceiling checks, outcome line counting, planted-leg
-bijection and empty-outcome verification, ``.cargo/mutants.toml`` validation,
+bijection and empty-outcome verification, Cargo and cargo-mutants config checks,
 ``/proc/<pid>/stat`` parsing and session cleanup error propagation, child
-subreaper and orphan reaping checks, ``CARGO_MUTANTS_*`` environment stripping,
+subreaper and orphan reaping checks, Cargo environment stripping,
 signal cancellation exit handling, and real Linux descendant cleanup.
 """
 
@@ -326,21 +326,40 @@ class ConfigAndArgvTests(unittest.TestCase):
 
     def test_load_config_requires_exact_test_runner_cap(self) -> None:
         """Reject a missing runner cap and a runner with a different limit."""
-        cases = (
-            'additional_cargo_args = ["--locked"]\n',
-            CAPPED_CARGO_ARGS.replace("--as=4294967296", "--as=8589934592"),
+        different_cap = MOD.TEST_RUNNER_CAP_ARG.replace(
+            "--as=4294967296", "--as=8589934592"
         )
+        cases = (["--locked"], ["--locked", different_cap])
         for idx in range(len(cases)):
+            cargo_args = json.dumps(cases[idx])
             with self.subTest(additional_cargo_args=cases[idx]):
                 cfg, status, err_txt = self.load_toml_text(
-                    cases[idx] + 'exclude_re = ["ok$"]\n'
+                    f'additional_cargo_args = {cargo_args}\nexclude_re = ["ok$"]\n'
                 )
                 self.assertEqual(status, 2)
                 self.assertIsNone(cfg)
                 self.assertIn("lacks the test runner memory cap", err_txt)
+                if different_cap in cases[idx]:
+                    self.assertIn("unsupported additional_cargo_args", err_txt)
+                    self.assertIn("--as=8589934592", err_txt)
+
+    def test_load_config_rejects_cargo_args_outside_allow_list(self) -> None:
+        """Reject runner overrides and unrelated arguments alongside the cap."""
+        cases = ('--config=target.x86_64-unknown-linux-gnu.runner=["env"]', "--offline")
+        for idx in range(len(cases)):
+            arg = cases[idx]
+            with self.subTest(arg=arg):
+                cargo_args = json.dumps(["--locked", MOD.TEST_RUNNER_CAP_ARG, arg])
+                cfg, status, err_txt = self.load_toml_text(
+                    f'additional_cargo_args = {cargo_args}\nexclude_re = ["ok$"]\n'
+                )
+                self.assertIsNone(cfg)
+                self.assertEqual(status, 2)
+                self.assertIn("mutants.toml", err_txt)
+                self.assertIn(arg, err_txt)
 
     def test_repository_config_has_test_runner_cap(self) -> None:
-        """Load the checked-in config and confirm it carries the required cap."""
+        """Confirm the checkout config carries the cap without runner overrides."""
         config_path = Path(__file__).resolve().parents[2] / ".cargo/mutants.toml"
         (cfg, status), _, err_txt = call_quiet(MOD.load_config, config_path)
         self.assertEqual(status, 0, err_txt)
@@ -416,8 +435,9 @@ class ConfigAndArgvTests(unittest.TestCase):
             "CARGO_MUTANTS_EXTRA": "1",
         }
         snapshot = dict(source)
-        cleaned = MOD.leg_environment(source)
+        cleaned, _, err_txt = call_quiet(MOD.leg_environment, source)
         self.assertEqual(source, snapshot)
+        self.assertEqual(err_txt, "")
         self.assertEqual(
             cleaned,
             {
@@ -425,6 +445,27 @@ class ConfigAndArgvTests(unittest.TestCase):
                 "CARGO_HOME": "/tmp/cargo",
             },
         )
+
+    def test_leg_environment_strips_target_runners_and_logs_only_keys(self) -> None:
+        """Drop runners for every target and report their names on one line."""
+        x86_key = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER"
+        arm_key = "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER"
+        source = {
+            x86_key: "x86-runner-value",
+            arm_key: "arm-runner-value",
+            "CARGO_TARGET_DIR": "build",
+            "CARGO_MUTANTS_JOBS": "16",
+            "UNCHANGED": "keep",
+        }
+        snapshot = dict(source)
+        cleaned, _, err_txt = call_quiet(MOD.leg_environment, source)
+        self.assertEqual(source, snapshot)
+        self.assertEqual(cleaned, {"CARGO_TARGET_DIR": "build", "UNCHANGED": "keep"})
+        self.assertEqual(len(err_txt.splitlines()), 1)
+        self.assertIn(x86_key, err_txt)
+        self.assertIn(arm_key, err_txt)
+        self.assertNotIn(source[x86_key], err_txt)
+        self.assertNotIn(source[arm_key], err_txt)
 
     def _invoke_gate_leg_capturing_dir(
         self, caught: int, unviable: int, leg_rc: int = 0
@@ -563,15 +604,17 @@ class ConfigAndArgvTests(unittest.TestCase):
         self.assertIn("caught mutants below the floor", err_txt)
 
     def test_run_leg_passes_sanitized_env_to_popen(self) -> None:
-        """Verify ``run_leg`` strips ``CARGO_MUTANTS_OUTPUT`` from ``Popen`` ``env``."""
+        """Pass the sanitized environment to the leg subprocess."""
         MOD.CANCEL_SIGNALS.clear()
         fake_proc = mock.MagicMock()
         fake_proc.pid = 777
         fake_proc.wait.return_value = 0
+        runner_key = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER"
         env_overrides = {
             "CARGO_MUTANTS_OUTPUT": "/tmp/override",
             "CARGO_MUTANTS_JOBS": "9",
             "MUTANTS_CHECK_KEEP": "present",
+            runner_key: "test-runner-value",
         }
         with (
             mock.patch.dict(os.environ, env_overrides, clear=False),
@@ -583,11 +626,92 @@ class ConfigAndArgvTests(unittest.TestCase):
         ):
             rc, _, err_txt = call_quiet(MOD.run_leg, "gate", ["--output", "."], 5)
         self.assertEqual(rc, 0)
-        self.assertEqual(err_txt, "")
+        self.assertIn(runner_key, err_txt)
         popen_env = mock_popen.call_args.kwargs["env"]
         self.assertNotIn("CARGO_MUTANTS_OUTPUT", popen_env)
         self.assertNotIn("CARGO_MUTANTS_JOBS", popen_env)
+        self.assertNotIn(runner_key, popen_env)
         self.assertEqual(popen_env.get("MUTANTS_CHECK_KEEP"), "present")
+
+
+class RepositoryCargoConfigTests(unittest.TestCase):
+    """Replay repository-local Cargo config validation through ``load_config``."""
+
+    def setUp(self) -> None:
+        """Create a temporary Cargo directory with a valid mutation config."""
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        self.cargo_dir = Path(tmp_dir.name) / ".cargo"
+        self.cargo_dir.mkdir()
+        self.mutants_config = self.cargo_dir / "mutants.toml"
+        self.mutants_config.write_text(
+            CAPPED_CARGO_ARGS + 'exclude_re = ["ok$"]\n', encoding="utf-8"
+        )
+
+    def assert_config_rejected(self, path: Path, message: str) -> None:
+        """Require status 2 and a diagnostic naming the offending file."""
+        (cfg, status), _, err_txt = call_quiet(MOD.load_config, self.mutants_config)
+        self.assertEqual(status, 2)
+        self.assertIsNone(cfg)
+        self.assertIn(str(path), err_txt)
+        self.assertIn(message, err_txt)
+
+    def assert_config_accepted(self) -> None:
+        """Require successful validation with no diagnostics."""
+        (cfg, status), _, err_txt = call_quiet(MOD.load_config, self.mutants_config)
+        self.assertEqual(status, 0, err_txt)
+        self.assertIsInstance(cfg, MOD.MutantsConfig)
+        self.assertEqual(err_txt, "")
+
+    def test_missing_cargo_config_passes(self) -> None:
+        """Accept a checkout with neither Cargo config filename."""
+        self.assert_config_accepted()
+
+    def test_cargo_config_without_target_runners_passes(self) -> None:
+        """Accept an alias named runner outside a target table."""
+        (self.cargo_dir / "config.toml").write_text(
+            '[alias]\nrunner = "test"\n', encoding="utf-8"
+        )
+        self.assert_config_accepted()
+
+    def test_cargo_config_rejects_target_triple_and_cfg_runners(self) -> None:
+        """Reject both forms of Cargo target runner."""
+        cases = (
+            (
+                "x86_64-unknown-linux-gnu",
+                '[target.x86_64-unknown-linux-gnu]\nrunner = ["env"]\n',
+            ),
+            ("cfg(unix)", "[target.'cfg(unix)']\nrunner = \"env\"\n"),
+        )
+        path = self.cargo_dir / "config.toml"
+        for idx in range(len(cases)):
+            target, content = cases[idx]
+            with self.subTest(target=target):
+                path.write_text(content, encoding="utf-8")
+                self.assert_config_rejected(path, target)
+
+    def test_cargo_config_rejects_legacy_filename(self) -> None:
+        """Check the legacy file even when a benign config.toml also exists."""
+        (self.cargo_dir / "config.toml").write_text("[alias]\n", encoding="utf-8")
+        path = self.cargo_dir / "config"
+        path.write_text(
+            '[target.x86_64-unknown-linux-gnu]\nrunner = ["env"]\n', encoding="utf-8"
+        )
+        self.assert_config_rejected(path, "x86_64-unknown-linux-gnu")
+
+    def test_cargo_config_rejects_invalid_toml(self) -> None:
+        """Fail closed on invalid syntax or encoding."""
+        path = self.cargo_dir / "config.toml"
+        path.write_text("[target\n", encoding="utf-8")
+        self.assert_config_rejected(path, "failed to read")
+        path.write_bytes(b"\xff")
+        self.assert_config_rejected(path, "failed to read")
+
+    def test_cargo_config_rejects_unreadable_path(self) -> None:
+        """Fail closed when the config path is a directory."""
+        path = self.cargo_dir / "config.toml"
+        path.mkdir()
+        self.assert_config_rejected(path, "failed to read")
 
 
 class ProcCleanupTests(unittest.TestCase):
