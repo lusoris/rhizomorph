@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+
+additional_cargo_args = ["--locked"]
+
+# CI sets RUSTFLAGS=-D warnings; without the cap a mutant that only adds a
+# warning (an unused parameter) counts as unviable instead of being tested.
+cap_lints = true
+
+exclude_re = [
+    # Equivalent: set_slot wrote lease, so lease_holds_any(prev_lease) is true when prev_lease == lease.
+    'replace match guard prev_lease != lease with true in write_output_slot$',
+    # Equivalent: unreachable since register_input rejects deadbands on Bool inputs before this match.
+    'delete match arm \(Value::Bool\(a\), Value::Bool\(b\)\) in should_emit_telemetry$',
+    # Equivalent: unreachable since register_input rejects deadbands on Bool inputs before this match.
+    'replace != with == in should_emit_telemetry$',
+    # Equivalent: should_emit_telemetry returns early on prev == next, so every caller passes diff >= 1.
+    'replace > with >= in u64_reaches_deadband$',
+]

@@ -112,3 +112,9 @@ exceptions:
     reason: adoption scaffolds no CI job for trivy declared by facet "security:high"; run it in a workflow, or remove this entry
     expires: "2027-02-16"
     category: D
+  - rule: mutants
+    path: .cargo/mutants.toml
+    reason: four kernel mutants are equivalent (forced-true write_output_slot guard returns the same None as the fallback arm; two Bool deadband arms unreachable because register_input refuses a Bool deadband; u64_reaches_deadband diff > 0 versus >= 0 after the caller ruled out diff 0); re-check each against crates/kernel/src/lib.rs when it changes and remove a pattern that a test can kill
+    entered: "2026-11-24"
+    expires: "2027-03-24"
+    category: D
