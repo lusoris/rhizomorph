@@ -359,9 +359,17 @@ class ConfigAndArgvTests(unittest.TestCase):
                 self.assertIn(arg, err_txt)
 
     def test_repository_config_has_test_runner_cap(self) -> None:
-        """Confirm the checkout config carries the cap without runner overrides."""
-        config_path = Path(__file__).resolve().parents[2] / ".cargo/mutants.toml"
-        (cfg, status), _, err_txt = call_quiet(MOD.load_config, config_path)
+        """Load the checkout config with its runner cap from a different directory."""
+        repo_root = Path(MOD.__file__).resolve().parent.parent
+        self.assertTrue(MOD.CONFIG_PATH.is_absolute())
+        self.assertEqual(MOD.CONFIG_PATH, repo_root / ".cargo/mutants.toml")
+        previous_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            os.chdir(tmp_dir)
+            try:
+                (cfg, status), _, err_txt = call_quiet(MOD.load_config, MOD.CONFIG_PATH)
+            finally:
+                os.chdir(previous_cwd)
         self.assertEqual(status, 0, err_txt)
         self.assertIsInstance(cfg, MOD.MutantsConfig)
         self.assertIn(MOD.TEST_RUNNER_CAP_ARG, cfg.additional_cargo_args)
@@ -604,7 +612,7 @@ class ConfigAndArgvTests(unittest.TestCase):
         self.assertIn("caught mutants below the floor", err_txt)
 
     def test_run_leg_passes_sanitized_env_to_popen(self) -> None:
-        """Pass the sanitized environment to the leg subprocess."""
+        """Start the leg subprocess at the repository root with a sanitized env."""
         MOD.CANCEL_SIGNALS.clear()
         fake_proc = mock.MagicMock()
         fake_proc.pid = 777
@@ -627,6 +635,7 @@ class ConfigAndArgvTests(unittest.TestCase):
             rc, _, err_txt = call_quiet(MOD.run_leg, "gate", ["--output", "."], 5)
         self.assertEqual(rc, 0)
         self.assertIn(runner_key, err_txt)
+        self.assertEqual(mock_popen.call_args.kwargs.get("cwd"), MOD.REPO_ROOT)
         popen_env = mock_popen.call_args.kwargs["env"]
         self.assertNotIn("CARGO_MUTANTS_OUTPUT", popen_env)
         self.assertNotIn("CARGO_MUTANTS_JOBS", popen_env)
@@ -674,6 +683,52 @@ class RepositoryCargoConfigTests(unittest.TestCase):
         )
         self.assert_config_accepted()
 
+    def test_cargo_config_rejects_includes(self) -> None:
+        """Refuse both include forms and check the legacy config for includes."""
+        cases = (
+            ("config.toml", '[[include]]\npath = "extra.toml"\n'),
+            ("config.toml", 'include = "extra.toml"\n'),
+            ("config", '[[include]]\npath = "extra.toml"\n'),
+        )
+        for idx in range(len(cases)):
+            filename, content = cases[idx]
+            path = self.cargo_dir / filename
+            with self.subTest(filename=filename, content=content):
+                path.write_text(content, encoding="utf-8")
+                self.assert_config_rejected(path, "include")
+            path.unlink()
+
+    def test_cargo_config_rejects_path_env(self) -> None:
+        """Refuse both table and string PATH settings in Cargo's environment."""
+        cases = ('{ value = "/tools", force = true }', '"/tools"')
+        path = self.cargo_dir / "config.toml"
+        for idx in range(len(cases)):
+            value = cases[idx]
+            with self.subTest(value=value):
+                path.write_text(f"[env]\nPATH = {value}\n", encoding="utf-8")
+                self.assert_config_rejected(path, "PATH")
+
+    def test_cargo_config_accepts_unrelated_env_key(self) -> None:
+        """Accept an environment table that leaves PATH alone."""
+        (self.cargo_dir / "config.toml").write_text(
+            '[env]\nRUST_LOG = "info"\n', encoding="utf-8"
+        )
+        self.assert_config_accepted()
+
+    def test_cargo_config_rejects_malformed_tables(self) -> None:
+        """Refuse scalar values in place of environment and target tables."""
+        cases = (
+            ('env = "x"\n', "env"),
+            ('target = "x"\n', "target"),
+            ("[target]\nfoo = 1\n", "target.foo"),
+        )
+        path = self.cargo_dir / "config.toml"
+        for idx in range(len(cases)):
+            content, key = cases[idx]
+            with self.subTest(key=key):
+                path.write_text(content, encoding="utf-8")
+                self.assert_config_rejected(path, f"malformed {key}")
+
     def test_cargo_config_rejects_target_triple_and_cfg_runners(self) -> None:
         """Reject both forms of Cargo target runner."""
         cases = (
@@ -712,6 +767,11 @@ class RepositoryCargoConfigTests(unittest.TestCase):
         path = self.cargo_dir / "config.toml"
         path.mkdir()
         self.assert_config_rejected(path, "failed to read")
+
+    def test_mutants_config_rejects_invalid_utf8(self) -> None:
+        """Report unreadable UTF-8 in mutants.toml as a configuration error."""
+        self.mutants_config.write_bytes(b"\xff")
+        self.assert_config_rejected(self.mutants_config, "failed to read")
 
 
 class ProcCleanupTests(unittest.TestCase):

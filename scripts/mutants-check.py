@@ -9,7 +9,9 @@ both packages that builds is caught by the test suite, and that the number of
 mutants that fail to build stays at or below a recorded ceiling. The planted leg
 replays only the ``exclude_re`` patterns with ``--no-config`` and proves both that
 the gate fails when a mutant survives and that every exclusion still names
-exactly one surviving equivalent mutant. The Linux-only runner marks itself a
+exactly one surviving equivalent mutant.
+
+Both legs run from the repository root. The Linux-only runner marks itself a
 child subreaper, strips ``CARGO_MUTANTS_*`` and ``CARGO_TARGET_*_RUNNER``
 environment overrides, kills session and reparented leftovers through pidfds,
 and fails closed unless ``waitpid(-1, WNOHANG)`` proves ``ECHILD``.
@@ -32,7 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 
-CONFIG_PATH = Path(".cargo/mutants.toml")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = REPO_ROOT / ".cargo" / "mutants.toml"
 ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
 # Required as one additional_cargo_args entry in .cargo/mutants.toml.
 TEST_RUNNER_CAP_ARG = """--config=target.'cfg(target_os = "linux")'.runner=["prlimit", "--as=4294967296"]"""
@@ -249,7 +252,7 @@ def parse_exclusions(
 
 
 def check_cargo_config(path: Path) -> bool:
-    """Accept a missing or readable Cargo config without target runners."""
+    """Accept missing configs and guard the runner cap in readable configs."""
     try:
         with path.open("rb") as handle:
             raw = tomllib.load(handle)
@@ -259,15 +262,33 @@ def check_cargo_config(path: Path) -> bool:
         err(f"failed to read {path}: {exc}")
         return False
 
-    targets = raw.get("target")
+    # An included file can set a target runner that overrides the memory cap.
+    if "include" in raw:
+        err(f"include in {path} can override the memory cap")
+        return False
+
+    env = raw.get("env", {})
+    if not isinstance(env, dict):
+        err(f"malformed env in {path}: expected a table")
+        return False
+    # A forced PATH changes which prlimit the memory cap runs.
+    if "PATH" in env:
+        err(f"env.PATH in {path} can override the prlimit executable")
+        return False
+
+    targets = raw.get("target", {})
     if not isinstance(targets, dict):
-        return True
+        err(f"malformed target in {path}: expected a table")
+        return False
     keys = list(targets)
     for idx in range(len(keys)):
         key = keys[idx]
         target = targets[key]
+        if not isinstance(target, dict):
+            err(f"malformed target.{key} in {path}: expected a table")
+            return False
         # A runner here can override or conflict with the test runner memory cap.
-        if isinstance(target, dict) and "runner" in target:
+        if "runner" in target:
             err(f"runner for target {key!r} in {path} can override the memory cap")
             return False
     return True
@@ -278,7 +299,7 @@ def load_config(path: Path) -> tuple[MutantsConfig | None, int]:
     try:
         with path.open("rb") as handle:
             raw = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         err(f"failed to read {path}: {exc}")
         return None, 2
 
@@ -749,6 +770,7 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
             ["cargo", "mutants", *args],
             start_new_session=True,
             env=leg_environment(os.environ),
+            cwd=REPO_ROOT,
         )
     except OSError as exc:
         err(f"{leg_name} leg failed to start cargo-mutants: {exc}")
