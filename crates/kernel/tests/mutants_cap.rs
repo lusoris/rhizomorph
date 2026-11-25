@@ -4,7 +4,10 @@
 //! Verify the address-space limit inherited by mutation tests.
 
 /// Read the soft address-space limit, distinguishing unlimited from invalid input.
-#[allow(clippy::option_option)]
+#[allow(
+    clippy::option_option,
+    reason = "None means a missing Max address space line or invalid value, Some(None) means unlimited, and Some(Some(n)) holds the finite byte count"
+)]
 fn soft_address_space_limit(text: &str) -> Option<Option<u64>> {
     for line in text.lines() {
         let Some(fields) = line

@@ -25,6 +25,7 @@ import os
 import re
 import select
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
+from typing import BinaryIO
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / ".cargo" / "mutants.toml"
@@ -80,6 +82,7 @@ COMMON_ARGS = (
 # then orphan reap), for 82 s per leg end and 900 + 600 + 2 * 82 = 1664 s total.
 GATE_TIMEOUT_SECONDS = 900
 PLANTED_TIMEOUT_SECONDS = 600
+PRLIMIT_PREFLIGHT_SECONDS = 30
 # Grace period after SIGTERM for cargo-mutants to stop its child process groups.
 TERMINATE_GRACE_SECONDS = 60
 # Reap deadline after SIGKILL so a stuck process cannot block indefinitely.
@@ -135,7 +138,7 @@ class MutantsConfig:
 
 
 class LegCancelled(Exception):
-    """Raised by ``run_leg`` after it stopped a leg on ``SIGINT`` or ``SIGTERM``."""
+    """Signal cancellation of a preflight or mutation session."""
 
     def __init__(self, signum: int) -> None:
         """Store the signal number ``signum`` that cancelled the leg."""
@@ -221,27 +224,36 @@ def leg_environment(environ: Mapping[str, str]) -> dict[str, str]:
 
 
 def check_prlimit(env: Mapping[str, str]) -> bool:
-    """Require the prlimit on the leg's PATH to set the child's soft limit."""
+    """Verify the limit reported by prlimit after bounded session cleanup."""
     cap = str(TEST_RUNNER_CAP_BYTES)
-    cmd = [
-        "prlimit",
-        f"--as={cap}",
-        sys.executable,
-        "-I",
-        "-c",
-        "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0])",
-    ]
     try:
-        result = subprocess.run(
-            cmd, check=False, env=env, cwd=REPO_ROOT, capture_output=True, timeout=30
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        with tempfile.TemporaryFile() as output:
+            rc = run_session(
+                "prlimit preflight",
+                [
+                    "prlimit",
+                    f"--as={cap}",
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0])",
+                ],
+                PRLIMIT_PREFLIGHT_SECONDS,
+                env,
+                stdout=output,
+            )
+            if rc is None:
+                err("prlimit preflight failed to complete with verified cleanup")
+                return False
+            if rc != 0:
+                err(f"prlimit preflight failed with exit {rc}")
+                return False
+            output.seek(0)
+            reported = output.read().strip()
+    except OSError as exc:
         err(f"prlimit preflight failed: {exc}")
         return False
-    if result.returncode != 0:
-        err(f"prlimit preflight failed with exit {result.returncode}")
-        return False
-    if result.stdout.strip() != cap.encode("ascii"):
+    if reported != cap.encode("ascii"):
         err(f"prlimit preflight did not report the expected RLIMIT_AS of {cap} bytes")
         return False
     return True
@@ -296,11 +308,22 @@ def parse_exclusions(
     return compiled, 0
 
 
+def read_config_toml(path: Path) -> dict[str, object]:
+    """Open without waiting on a FIFO and parse only a regular file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return tomllib.load(handle)
+    finally:
+        os.close(fd)
+
+
 def check_cargo_config(path: Path) -> bool:
     """Accept missing configs and guard the runner cap in readable configs."""
     try:
-        with path.open("rb") as handle:
-            raw = tomllib.load(handle)
+        raw = read_config_toml(path)
     except FileNotFoundError:
         # Cargo also treats a dangling config symlink as absent.
         return True
@@ -319,8 +342,7 @@ def check_cargo_config(path: Path) -> bool:
 def load_config(path: Path) -> tuple[MutantsConfig | None, int]:
     """Validate mutation settings and guard the test runner cap."""
     try:
-        with path.open("rb") as handle:
-            raw = tomllib.load(handle)
+        raw = read_config_toml(path)
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         err(f"failed to read {path}: {exc}")
         return None, 2
@@ -709,12 +731,12 @@ def reap_orphans(leg_name: str) -> bool:
 
 
 def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
-    """Stop a ``cargo mutants`` process with SIGTERM, then SIGKILL.
+    """Stop the session leader with SIGTERM, then SIGKILL.
 
-    ``cargo-mutants`` runs in its own session and stays unreaped until session
+    The leader runs in its own session and stays unreaped until session
     cleanup finishes, so its PID keeps the session ID reserved while ``/proc``
     is scanned and remaining descendants are killed via pidfds. After
-    ``proc.wait`` reaps ``cargo-mutants``, child-subreaper cleanup kills and
+    ``proc.wait`` reaps the leader, child-subreaper cleanup kills and
     drains reparented orphans until ``waitpid(-1, WNOHANG)`` raises ``ECHILD``.
     Signals arriving during the stop are only recorded, so the stop always
     completes.
@@ -726,7 +748,7 @@ def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
     else:
         err(
             f"{leg_name} leg ignored SIGTERM for {TERMINATE_GRACE_SECONDS}s; "
-            "killing cargo-mutants and its session"
+            "killing the session leader and its descendants"
         )
         signal_leg(proc, signal.SIGKILL)
         exited = wait_exited(proc.pid, KILL_WAIT_SECONDS)
@@ -746,7 +768,7 @@ def stop_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> None:
 def reap_exited_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> int | None:
     """Clean up session leftovers, reap ``proc``, and prove no descendants remain.
 
-    After ``proc.wait`` reaps ``cargo-mutants``, child-subreaper cleanup drains
+    After ``proc.wait`` reaps the session leader, child-subreaper cleanup drains
     reparented descendants until ``waitpid(-1, WNOHANG)`` raises ``ECHILD`` as
     proof that no descendant remains.
     """
@@ -767,21 +789,28 @@ def reap_exited_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> int | None:
 
 
 def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
-    """Run ``cargo mutants`` with ``args`` and a bounded SIGTERM-then-kill deadline.
+    """Run ``cargo mutants`` in a bounded session with the filtered Cargo environment."""
+    return run_session(
+        leg_name,
+        ["cargo", "mutants", *args],
+        timeout_seconds,
+        leg_environment(os.environ),
+    )
 
-    The executable and subcommand are literals at the call site, each element
-    of ``args`` is passed as one argv element without a shell, and the leg runs
-    in a session of its own so every descendant can be found. The Cargo
-    environment is filtered via ``leg_environment`` so CLI flags govern every
-    run and test binaries can verify the cap. Processes left in the
-    leg session are killed while the unreaped ``cargo-mutants`` zombie holds the
-    session ID, and child-subreaper orphan cleanup then requires ``waitpid``
-    ``ECHILD`` proof before returning the exit code. Exceeding
-    ``timeout_seconds`` stops the leg with ``SIGTERM`` then ``SIGKILL``. A
-    ``SIGINT`` or ``SIGTERM`` recorded by ``request_cancel`` stops a running leg
-    within ``LEG_POLL_SECONDS``, and ``LegCancelled`` is raised if a signal
-    arrived before start, during the poll, during exit cleanup and reap, or
-    during a deadline stop rather than returning ``rc`` or ``None``.
+
+def run_session(
+    leg_name: str,
+    argv: list[str],
+    timeout_seconds: int,
+    env: Mapping[str, str],
+    *,
+    stdout: BinaryIO | None = None,
+) -> int | None:
+    """Run argv directly in its own session, optionally writing stdout to a file.
+
+    Stop at the deadline with SIGTERM then SIGKILL. Return the exit code only
+    after session cleanup and subreaper orphan reaping are verified. A recorded
+    SIGINT or SIGTERM stops the session and raises ``LegCancelled``.
     """
     sys.stdout.flush()
     sys.stderr.flush()
@@ -789,13 +818,14 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
         raise LegCancelled(CANCEL_SIGNALS[0])
     try:
         proc = subprocess.Popen(
-            ["cargo", "mutants", *args],
+            argv,
             start_new_session=True,
-            env=leg_environment(os.environ),
+            env=env,
             cwd=REPO_ROOT,
+            stdout=stdout,
         )
     except OSError as exc:
-        err(f"{leg_name} leg failed to start cargo-mutants: {exc}")
+        err(f"{leg_name} leg failed to start {argv[0]}: {exc}")
         if CANCEL_SIGNALS:
             raise LegCancelled(CANCEL_SIGNALS[0]) from exc
         return None
@@ -804,7 +834,7 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
         if CANCEL_SIGNALS:
             err(
                 f"{leg_name} leg cancelled by "
-                f"{signal.Signals(CANCEL_SIGNALS[0]).name}; stopping cargo-mutants"
+                f"{signal.Signals(CANCEL_SIGNALS[0]).name}; stopping the session"
             )
             stop_leg(leg_name, proc)
             raise LegCancelled(CANCEL_SIGNALS[0])
@@ -1005,22 +1035,21 @@ def run_gate_leg() -> int:
 
 
 def main() -> int:
-    """Validate configuration and the runner cap before running both legs."""
-    # Signals are recorded, never raised, so a leg stop cannot be interrupted
-    # (cargo-mutants runs in its own session and does not get them).
+    """Validate settings, enable subreaping, and run preflight and mutation legs."""
+    # Record signals to let session cleanup finish before returning.
     signal.signal(signal.SIGINT, request_cancel)
     signal.signal(signal.SIGTERM, request_cancel)
     config, status = load_config(CONFIG_PATH)
     if config is None:
         cancelled = cancel_status()
         return cancelled if cancelled is not None else status
-    if not check_prlimit(leg_environment(os.environ)):
-        cancelled = cancel_status()
-        return cancelled if cancelled is not None else 2
     if not enable_subreaper():
         cancelled = cancel_status()
         return cancelled if cancelled is not None else 1
     try:
+        if not check_prlimit(leg_environment(os.environ)):
+            cancelled = cancel_status()
+            return cancelled if cancelled is not None else 2
         leg_status = run_gate_leg()
         cancelled = cancel_status()
         if cancelled is not None:

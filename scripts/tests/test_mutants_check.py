@@ -26,11 +26,14 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
-from typing import TypeVar
+from typing import BinaryIO, TypeVar
 from unittest import mock
+
+if sys.platform.startswith("linux"):
+    import resource
 
 T = TypeVar("T")
 
@@ -67,6 +70,19 @@ def call_quiet(
     with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
         result = func(*args, **kwargs)
     return result, out_buf.getvalue(), err_buf.getvalue()
+
+
+@contextlib.contextmanager
+def temporary_address_space_limit(target: int) -> Iterator[None]:
+    """Set a test's soft RLIMIT_AS without changing its hard limit."""
+    original = resource.getrlimit(resource.RLIMIT_AS)
+    _, hard = original
+    soft = target if hard == resource.RLIM_INFINITY else min(target, hard)
+    resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
+    try:
+        yield
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, original)
 
 
 def write_mutants_out(base_dir: Path, files: dict[str, str]) -> Path:
@@ -785,11 +801,38 @@ class RepositoryCargoConfigTests(unittest.TestCase):
         path.write_bytes(b"\xff")
         self.assert_config_rejected(path, "failed to read")
 
-    def test_cargo_config_rejects_unreadable_path(self) -> None:
+    def test_cargo_config_rejects_directory(self) -> None:
         """Fail closed when the config path is a directory."""
         path = self.cargo_dir / "config.toml"
         path.mkdir()
-        self.assert_config_rejected(path, "failed to read")
+        self.assert_config_rejected(path, "not a regular file")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux FIFOs")
+    def test_config_fifos_are_rejected_without_a_writer(self) -> None:
+        """Refuse either config FIFO without waiting for a writer."""
+
+        def fifo_open_timed_out(_signum: int, _frame: object) -> None:
+            """Fail the fixture if opening the FIFO blocks."""
+            raise AssertionError("blocked opening a config FIFO without a writer")
+
+        previous = signal.signal(signal.SIGALRM, fifo_open_timed_out)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        self.addCleanup(signal.alarm, 0)
+        cargo_config = self.cargo_dir / "config.toml"
+        with self.subTest(path=cargo_config):
+            os.mkfifo(cargo_config, 0o600)
+            signal.alarm(2)
+            ok, _, err_txt = call_quiet(MOD.check_cargo_config, cargo_config)
+            signal.alarm(0)
+            self.assertFalse(ok)
+            self.assertIn(str(cargo_config), err_txt)
+            self.assertIn("not a regular file", err_txt)
+        with self.subTest(path=self.mutants_config):
+            self.mutants_config.unlink()
+            os.mkfifo(self.mutants_config, 0o600)
+            signal.alarm(2)
+            self.assert_config_rejected(self.mutants_config, "not a regular file")
+            signal.alarm(0)
 
     def test_mutants_config_rejects_invalid_utf8(self) -> None:
         """Report unreadable UTF-8 in mutants.toml as a configuration error."""
@@ -821,7 +864,8 @@ class PrlimitTests(unittest.TestCase):
             shim.write_text('#!/bin/sh\nshift\nexec "$@"\n', encoding="utf-8")
             shim.chmod(0o755)
             env = {"PATH": f"{tmp_dir}{os.pathsep}{os.defpath}"}
-            ok, _, err_txt = call_quiet(MOD.check_prlimit, env)
+            with temporary_address_space_limit(MOD.TEST_RUNNER_CAP_BYTES - 4096):
+                ok, _, err_txt = call_quiet(MOD.check_prlimit, env)
         self.assertFalse(ok)
         self.assertIn("prlimit preflight", err_txt)
         self.assertIn("RLIMIT_AS", err_txt)
@@ -833,18 +877,8 @@ class PrlimitTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("prlimit preflight", err_txt)
 
-    def test_prlimit_timeout(self) -> None:
-        """Reject a preflight that exceeds the subprocess deadline."""
-        with mock.patch.object(
-            MOD.subprocess, "run", side_effect=subprocess.TimeoutExpired("prlimit", 30)
-        ):
-            ok, _, err_txt = call_quiet(MOD.check_prlimit, {})
-        self.assertFalse(ok)
-        self.assertIn("prlimit preflight", err_txt)
-        self.assertIn("timed out", err_txt)
-
     def test_prlimit_uses_leg_environment_and_deadline(self) -> None:
-        """Verify the preflight command, environment, working directory, and deadline."""
+        """Pin the preflight argv, deadline, and session subprocess options."""
         env = {"MUTANTS_CHECK_SENTINEL": "present"}
         cmd = [
             "prlimit",
@@ -854,57 +888,84 @@ class PrlimitTests(unittest.TestCase):
             "-c",
             "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0])",
         ]
-        with mock.patch.object(
-            MOD.subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess(cmd, 0, b"4294967296\n"),
-        ) as run:
+        proc = mock.Mock(pid=777)
+
+        def start(*_args: object, stdout: BinaryIO, **_kwargs: object) -> mock.Mock:
+            """Write the child output to the provided temporary file."""
+            self.assertGreaterEqual(stdout.fileno(), 0)
+            stdout.write(b"4294967296\n")
+            return proc
+
+        with (
+            mock.patch.object(MOD, "run_session", wraps=MOD.run_session) as session,
+            mock.patch.object(MOD.subprocess, "Popen", side_effect=start) as popen,
+            mock.patch.object(MOD, "wait_exited", return_value=True),
+            mock.patch.object(MOD, "reap_exited_leg", return_value=0),
+        ):
             self.assertTrue(MOD.check_prlimit(env))
-        run.assert_called_once_with(
+        stdout = popen.call_args.kwargs["stdout"]
+        self.assertTrue(stdout.closed)
+        self.assertEqual(MOD.PRLIMIT_PREFLIGHT_SECONDS, 30)
+        session.assert_called_once_with(
+            "prlimit preflight", cmd, 30, env, stdout=stdout
+        )
+        popen.assert_called_once_with(
             cmd,
-            check=False,
+            start_new_session=True,
             env=env,
             cwd=MOD.REPO_ROOT,
-            capture_output=True,
-            timeout=30,
+            stdout=stdout,
         )
 
-    def test_prlimit_rejects_wrong_output_or_nonzero_exit(self) -> None:
-        """Require an exact cap reading as well as a successful exit."""
-        cases = ((0, b"4294967295\n", "RLIMIT_AS"), (1, b"4294967296\n", "exit 1"))
+    def test_prlimit_requires_cap_and_verified_success(self) -> None:
+        """Require the exact cap, a successful exit, and verified cleanup."""
+        cases = (
+            (0, b"4294967295\n", "did not report the expected RLIMIT_AS"),
+            (1, b"4294967296\n", "failed with exit 1"),
+            (None, b"4294967296\n", "failed to complete with verified cleanup"),
+        )
         for idx in range(len(cases)):
             rc, output, message = cases[idx]
             with (
                 self.subTest(rc=rc, output=output),
                 mock.patch.object(
-                    MOD.subprocess,
-                    "run",
-                    return_value=subprocess.CompletedProcess("prlimit", rc, output),
+                    MOD.tempfile, "TemporaryFile", return_value=io.BytesIO(output)
                 ),
+                mock.patch.object(MOD, "run_session", return_value=rc),
             ):
                 ok, _, err_txt = call_quiet(MOD.check_prlimit, {})
             self.assertFalse(ok)
             self.assertIn("prlimit preflight", err_txt)
             self.assertIn(message, err_txt)
 
-    def test_main_stops_before_enabling_subreaper_when_preflight_fails(self) -> None:
-        """Pass the leg environment to preflight and start neither leg on failure."""
+    def test_main_enables_subreaper_before_preflight(self) -> None:
+        """Enable subreaping, pass the leg environment, and stop on preflight failure."""
         config = MOD.MutantsConfig([], [], False)
         env = {"PATH": os.defpath, "RHIZOMORPH_MUTANTS_AS_CAP": "4294967296"}
+        startup = mock.Mock()
         with (
             mock.patch.object(signal, "signal"),
-            mock.patch.object(MOD, "load_config", return_value=(config, 0)),
+            mock.patch.object(MOD, "load_config", return_value=(config, 0)) as load,
             mock.patch.object(MOD, "leg_environment", return_value=env) as mock_env,
             mock.patch.object(MOD, "check_prlimit", return_value=False) as preflight,
-            mock.patch.object(MOD, "enable_subreaper") as subreaper,
+            mock.patch.object(MOD, "enable_subreaper", return_value=True) as subreaper,
             mock.patch.object(MOD, "run_gate_leg", return_value=0) as gate,
             mock.patch.object(MOD, "run_planted_leg", return_value=0) as planted,
         ):
+            startup.attach_mock(load, "load")
+            startup.attach_mock(subreaper, "subreaper")
+            startup.attach_mock(preflight, "preflight")
             rc, _, _ = call_quiet(MOD.main)
         self.assertEqual(rc, 2)
         mock_env.assert_called_once_with(os.environ)
-        preflight.assert_called_once_with(env)
-        subreaper.assert_not_called()
+        self.assertEqual(
+            startup.mock_calls,
+            [
+                mock.call.load(MOD.CONFIG_PATH),
+                mock.call.subreaper(),
+                mock.call.preflight(env),
+            ],
+        )
         gate.assert_not_called()
         planted.assert_not_called()
 
@@ -1166,12 +1227,13 @@ class SubreaperAndOrphanTests(unittest.TestCase):
         with (
             mock.patch.object(signal, "signal"),
             mock.patch.object(MOD, "load_config", return_value=(cfg, 0)),
-            mock.patch.object(MOD, "check_prlimit", return_value=True),
+            mock.patch.object(MOD, "check_prlimit", return_value=True) as preflight,
             mock.patch.object(MOD, "enable_subreaper", return_value=False),
             mock.patch.object(MOD, "run_gate_leg") as mock_gate,
         ):
             rc, _, _ = call_quiet(MOD.main)
         self.assertEqual(rc, 1)
+        self.assertFalse(preflight.called, "preflight ran without a subreaper")
         mock_gate.assert_not_called()
 
     def test_reap_orphans_drain_and_kill_rounds(self) -> None:
@@ -1388,14 +1450,34 @@ class CancellationTests(unittest.TestCase):
             mock.patch.object(signal, "signal"),
             mock.patch.object(MOD, "load_config", return_value=(config, 0)),
             mock.patch.object(MOD, "check_prlimit", return_value=False),
-            mock.patch.object(MOD, "enable_subreaper") as subreaper,
+            mock.patch.object(MOD, "enable_subreaper", return_value=True) as subreaper,
             mock.patch.object(MOD, "run_gate_leg") as gate,
         ):
             rc, _, err_txt = call_quiet(MOD.main)
         self.assertEqual(rc, MOD.SIGNAL_EXIT_BASE + int(signal.SIGTERM))
         self.assertIn("cancelled by SIGTERM", err_txt)
-        subreaper.assert_not_called()
+        subreaper.assert_called_once_with()
         gate.assert_not_called()
+
+    def test_main_catches_preflight_cancellation(self) -> None:
+        """Report a session cancellation from preflight and skip both legs."""
+        config = MOD.MutantsConfig([], [], False)
+        signum = int(signal.SIGTERM)
+        with (
+            mock.patch.object(signal, "signal"),
+            mock.patch.object(MOD, "load_config", return_value=(config, 0)),
+            mock.patch.object(MOD, "enable_subreaper", return_value=True),
+            mock.patch.object(
+                MOD, "check_prlimit", side_effect=MOD.LegCancelled(signum)
+            ),
+            mock.patch.object(MOD, "run_gate_leg") as gate,
+            mock.patch.object(MOD, "run_planted_leg") as planted,
+        ):
+            rc, _, err_txt = call_quiet(MOD.main)
+        self.assertEqual(rc, MOD.SIGNAL_EXIT_BASE + signum)
+        self.assertIn("cancelled by SIGTERM", err_txt)
+        gate.assert_not_called()
+        planted.assert_not_called()
 
     def test_main_honours_late_cancel_after_legs(self) -> None:
         """Return ``128 + signum`` if a signal arrives after ``run_leg`` returns."""
@@ -1543,7 +1625,6 @@ class RealDescendantCleanupTests(unittest.TestCase):
         self.fifo_path = self.base / "grandchild.fifo"
         self.ready_path = self.base / "ready.fifo"
         self.pid_file = self.base / "grandchild.pid"
-        self.stub_path = self.base / "cargo"
         os.mkfifo(self.fifo_path, 0o600)
         os.mkfifo(self.ready_path, 0o600)
         self.assertTrue(MOD.enable_subreaper())
@@ -1592,8 +1673,10 @@ class RealDescendantCleanupTests(unittest.TestCase):
             with contextlib.suppress(OSError):
                 os.close(fd)
 
-    def _write_cargo_stub(self, launcher_prefix: str, tail_cmd: str) -> None:
-        """Write an executable ``cargo`` shell stub spawning a FIFO-holding child."""
+    def _write_process_stub(
+        self, executable: str, launcher_prefix: str, tail_cmd: str
+    ) -> None:
+        """Write a shell stub spawning a FIFO-holding child."""
         quoted_pid = shlex.quote(str(self.pid_file))
         quoted_fifo = shlex.quote(str(self.fifo_path))
         quoted_ready = shlex.quote(str(self.ready_path))
@@ -1610,8 +1693,9 @@ class RealDescendantCleanupTests(unittest.TestCase):
             f"read -r _ < {quoted_ready}\n"
             f"{tail_cmd}\n"
         )
-        self.stub_path.write_text(script, encoding="utf-8")
-        os.chmod(self.stub_path, 0o755)
+        stub_path = self.base / executable
+        stub_path.write_text(script, encoding="utf-8")
+        stub_path.chmod(0o755)
 
     def _assert_fifo_byte_then_eof(self) -> None:
         """Verify the grandchild wrote one byte and every writer closed the FIFO."""
@@ -1625,7 +1709,7 @@ class RealDescendantCleanupTests(unittest.TestCase):
 
     def test_timeout_stops_real_descendant(self) -> None:
         """Stop a timed-out stub and verify its background grandchild reaches EOF."""
-        self._write_cargo_stub("", "exec sleep 60")
+        self._write_process_stub("cargo", "", "exec sleep 60")
         prepended_path = f"{self.base}{os.pathsep}{os.environ.get('PATH', '')}"
         with (
             mock.patch.dict(os.environ, {"PATH": prepended_path}),
@@ -1639,13 +1723,43 @@ class RealDescendantCleanupTests(unittest.TestCase):
     def test_exit_reaps_setsid_orphan_before_returning(self) -> None:
         """Kill and reap a ``setsid`` grandchild before returning exit code ``0``."""
         # Kills mutation reap_orphans -> return True, which keeps grandchild alive.
-        self._write_cargo_stub("setsid", "exit 0")
+        self._write_process_stub("cargo", "setsid", "exit 0")
         prepended_path = f"{self.base}{os.pathsep}{os.environ.get('PATH', '')}"
         with mock.patch.dict(os.environ, {"PATH": prepended_path}):
             rc, _, err_txt = call_quiet(MOD.run_leg, "gate", [], 5)
         self.assertEqual(rc, 0)
         self.assertEqual(err_txt, "")
         self._assert_fifo_byte_then_eof()
+
+    def _assert_descendant_reaped(self) -> None:
+        """Verify the recorded child PID is gone and its FIFO has reached EOF."""
+        pid = int(self.pid_file.read_text(encoding="utf-8"))
+        self.assertFalse(Path(f"/proc/{pid}").exists(), f"descendant {pid} remains")
+        self._assert_fifo_byte_then_eof()
+
+    def test_prlimit_timeout_reaps_descendant(self) -> None:
+        """Reject a timed-out prlimit and reap its background child before return."""
+        self._write_process_stub("prlimit", "", "exec sleep 4")
+        env = {"PATH": f"{self.base}{os.pathsep}{os.defpath}"}
+        with (
+            mock.patch.object(MOD, "PRLIMIT_PREFLIGHT_SECONDS", 2),
+            mock.patch.object(MOD, "TERMINATE_GRACE_SECONDS", 1),
+        ):
+            ok, _, err_txt = call_quiet(MOD.check_prlimit, env)
+        self._assert_descendant_reaped()
+        self.assertFalse(ok)
+        self.assertIn("prlimit preflight failed", err_txt)
+        self.assertIn("exceeded its 2s deadline", err_txt)
+
+    def test_prlimit_success_reaps_setsid_orphan(self) -> None:
+        """Accept the printed cap after reaping an orphan in a separate session."""
+        self._write_process_stub(
+            "prlimit", "setsid", f"printf '%s\\n' {MOD.TEST_RUNNER_CAP_BYTES}\nexit 0"
+        )
+        env = {"PATH": f"{self.base}{os.pathsep}{os.defpath}"}
+        ok, _, err_txt = call_quiet(MOD.check_prlimit, env)
+        self._assert_descendant_reaped()
+        self.assertTrue(ok, err_txt)
 
 
 if __name__ == "__main__":
