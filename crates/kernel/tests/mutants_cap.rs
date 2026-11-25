@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 // SPDX-License-Identifier: EUPL-1.2
 
-//! Verify the address-space limit inherited by mutation tests.
+//! Verify the inherited address-space limit against the compile-time mutation cap.
 
 /// Read the soft address-space limit, distinguishing unlimited from invalid input.
 #[allow(
@@ -26,18 +26,17 @@ fn soft_address_space_limit(text: &str) -> Option<Option<u64>> {
     None
 }
 
-/// Fail if the mutation leg's requested cap did not reach this test binary.
+/// Fail if the binary's address-space limit differs from the cap set at compile time.
 #[test]
 #[allow(
     clippy::assertions_on_constants,
     reason = "Only mutation legs require Linux"
 )]
 fn mutation_runner_sets_address_space_cap() {
-    let Some(marker) = std::env::var_os("RHIZOMORPH_MUTANTS_AS_CAP") else {
+    let Some(marker) = option_env!("RHIZOMORPH_MUTANTS_AS_CAP") else {
         return;
     };
-    let cap = marker
-        .to_str()
+    let cap = Some(marker)
         .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|value| value.parse::<u64>().ok())
         .expect("RHIZOMORPH_MUTANTS_AS_CAP must be a decimal byte count");

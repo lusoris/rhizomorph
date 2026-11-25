@@ -14,8 +14,9 @@ exactly one surviving equivalent mutant.
 Both legs run from the repository root. The Linux-only runner marks itself a
 child subreaper, allow-lists Cargo configuration and environment keys, and
 checks that prlimit applies the cap before either leg runs. A test in each
-package verifies the inherited cap. The runner kills session and reparented
-leftovers through pidfds and requires ``waitpid(-1, WNOHANG)`` to prove ``ECHILD``.
+package compares the inherited limit with the cap recorded at compile time.
+The runner kills session and reparented leftovers through pidfds and requires
+``waitpid(-1, WNOHANG)`` to prove ``ECHILD``.
 """
 
 from __future__ import annotations
@@ -203,7 +204,7 @@ def enable_subreaper() -> bool:
 
 
 def leg_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    """Keep approved Cargo keys and mark the cap that each test suite must see."""
+    """Keep approved Cargo keys and set the compile-time marker for the cap."""
     keys = list(environ.keys())
     cleaned: dict[str, str] = {}
     dropped: list[str] = []
@@ -249,11 +250,12 @@ def check_prlimit(env: Mapping[str, str]) -> bool:
                 err(f"prlimit preflight failed with exit {rc}")
                 return False
             output.seek(0)
-            reported = output.read().strip()
+            reported = output.read(64)
     except OSError as exc:
         err(f"prlimit preflight failed: {exc}")
         return False
-    if reported != cap.encode("ascii"):
+    # A full buffer may hide extra output after the cap.
+    if len(reported) == 64 or reported.strip() != cap.encode("ascii"):
         err(f"prlimit preflight did not report the expected RLIMIT_AS of {cap} bytes")
         return False
     return True

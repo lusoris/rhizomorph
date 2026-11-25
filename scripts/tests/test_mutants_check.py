@@ -840,16 +840,98 @@ class RepositoryCargoConfigTests(unittest.TestCase):
         self.assert_config_rejected(self.mutants_config, "failed to read")
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux")
+    and all(shutil.which(tool) for tool in ("cargo", "rustc", "prlimit")),
+    "requires Linux with cargo, rustc, and prlimit on PATH",
+)
+class CargoRunnerCapTests(unittest.TestCase):
+    """Check the mutation cap canary against Cargo home runner configuration."""
+
+    def setUp(self) -> None:
+        """Use a fresh Cargo home and keep build artifacts in the ignored target tree."""
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        self.cargo_home = Path(tmp_dir.name)
+        self.env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("CARGO_", "GIT_"))
+            and key != "RHIZOMORPH_MUTANTS_AS_CAP"
+        }
+        self.env.update(
+            CARGO_HOME=tmp_dir.name,
+            CARGO_NET_OFFLINE="true",
+            CARGO_TARGET_DIR=str(MOD.REPO_ROOT / "target" / "mutants-cap-fixture"),
+        )
+
+    def run_canary(self, *, mutation_leg: bool) -> subprocess.CompletedProcess[str]:
+        """Build and run only the shared canary, optionally with the mutation cap."""
+        env = self.env.copy()
+        args = ["cargo", "test", "--locked", "-p", "kernel", "--test", "mutants_cap"]
+        if mutation_leg:
+            env["RHIZOMORPH_MUTANTS_AS_CAP"] = str(MOD.TEST_RUNNER_CAP_BYTES)
+            args.append(MOD.TEST_RUNNER_CAP_ARG)
+        args.extend(("--", "mutation_runner_sets_address_space_cap"))
+        return subprocess.run(
+            args,
+            cwd=MOD.REPO_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+
+    def test_home_runner_cannot_clear_cap_canary(self) -> None:
+        """Reject a host runner that skips the cap and clears the test environment."""
+        version = subprocess.run(
+            ["rustc", "-vV"],
+            cwd=MOD.REPO_ROOT,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        host = version.stdout.partition("\nhost: ")[2].partition("\n")[0]
+        self.assertTrue(host, version.stdout)
+        (self.cargo_home / "config.toml").write_text(
+            f'[target.{host}]\nrunner = ["env", "-i"]\n', encoding="utf-8"
+        )
+        result = self.run_canary(mutation_leg=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("mutation_runner_sets_address_space_cap", result.stdout)
+        self.assertIn("mutation test binary must inherit RLIMIT_AS", result.stdout)
+
+    def test_mutation_leg_with_cap_runner_passes(self) -> None:
+        """Accept the configured prlimit runner when it applies the requested cap."""
+        result = self.run_canary(mutation_leg=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "test mutation_runner_sets_address_space_cap ... ok", result.stdout
+        )
+
+    def test_unmarked_build_without_cap_passes(self) -> None:
+        """Allow plain Cargo tests without the mutation marker or runner cap."""
+        result = self.run_canary(mutation_leg=False)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "test mutation_runner_sets_address_space_cap ... ok", result.stdout
+        )
+
+
 class PrlimitTests(unittest.TestCase):
     """Verify the executable on the leg's PATH enforces the cap."""
 
-    @unittest.skipUnless(
-        sys.platform.startswith("linux") and shutil.which("prlimit") is not None,
-        "requires Linux util-linux prlimit",
-    )
     def test_real_prlimit_sets_cap(self) -> None:
         """Accept util-linux prlimit when the Python child sees 4 GiB."""
-        ok, _, err_txt = call_quiet(MOD.check_prlimit, {"PATH": os.defpath})
+        prlimit = shutil.which("prlimit")
+        if not sys.platform.startswith("linux") or prlimit is None:
+            self.skipTest("requires Linux util-linux prlimit")
+        env = {"PATH": f"{Path(prlimit).absolute().parent}{os.pathsep}{os.defpath}"}
+        ok, _, err_txt = call_quiet(MOD.check_prlimit, env)
         self.assertTrue(ok, err_txt)
         self.assertEqual(err_txt, "")
 
@@ -937,6 +1019,20 @@ class PrlimitTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("prlimit preflight", err_txt)
             self.assertIn(message, err_txt)
+
+    def test_prlimit_rejects_oversized_output(self) -> None:
+        """Reject 100,000 bytes even when the output starts with the expected cap."""
+        cap = str(MOD.TEST_RUNNER_CAP_BYTES).encode("ascii")
+        output = io.BytesIO(cap.ljust(100_000, b" "))
+        with (
+            mock.patch.object(output, "read", wraps=output.read) as read,
+            mock.patch.object(MOD.tempfile, "TemporaryFile", return_value=output),
+            mock.patch.object(MOD, "run_session", return_value=0),
+        ):
+            ok, _, err_txt = call_quiet(MOD.check_prlimit, {})
+        read.assert_called_once_with(64)
+        self.assertFalse(ok)
+        self.assertIn("did not report the expected RLIMIT_AS", err_txt)
 
     def test_main_enables_subreaper_before_preflight(self) -> None:
         """Enable subreaping, pass the leg environment, and stop on preflight failure."""
@@ -1489,20 +1585,6 @@ class CancellationTests(unittest.TestCase):
             MOD.CANCEL_SIGNALS.append(int(signal.SIGTERM))
             return 0
 
-        with (
-            mock.patch.object(signal, "signal"),
-            mock.patch.object(MOD, "load_config", return_value=(cfg, 0)),
-            mock.patch.object(MOD, "check_prlimit", return_value=True),
-            mock.patch.object(MOD, "enable_subreaper", return_value=True),
-            mock.patch.object(MOD, "run_gate_leg", return_value=0),
-            mock.patch.object(MOD, "run_planted_leg", side_effect=cancel_in_planted),
-        ):
-            rc, _, err_txt = call_quiet(MOD.main)
-            self.assertEqual(rc, MOD.SIGNAL_EXIT_BASE + int(signal.SIGTERM))
-            self.assertIn("cancelled by SIGTERM", err_txt)
-
-        MOD.CANCEL_SIGNALS.clear()
-
         def cancel_in_gate() -> int:
             """Simulate ``SIGINT`` arriving after ``run_leg`` in ``run_gate_leg``."""
             MOD.CANCEL_SIGNALS.append(int(signal.SIGINT))
@@ -1513,13 +1595,22 @@ class CancellationTests(unittest.TestCase):
             mock.patch.object(MOD, "load_config", return_value=(cfg, 0)),
             mock.patch.object(MOD, "check_prlimit", return_value=True),
             mock.patch.object(MOD, "enable_subreaper", return_value=True),
-            mock.patch.object(MOD, "run_gate_leg", side_effect=cancel_in_gate),
-            mock.patch.object(MOD, "run_planted_leg") as mock_planted,
+            mock.patch.object(MOD, "run_gate_leg", return_value=0) as gate,
+            mock.patch.object(
+                MOD, "run_planted_leg", side_effect=cancel_in_planted
+            ) as planted,
         ):
+            rc, _, err_txt = call_quiet(MOD.main)
+            self.assertEqual(rc, MOD.SIGNAL_EXIT_BASE + int(signal.SIGTERM))
+            self.assertIn("cancelled by SIGTERM", err_txt)
+
+            MOD.CANCEL_SIGNALS.clear()
+            gate.side_effect = cancel_in_gate
+            planted.reset_mock()
             rc, _, err_txt = call_quiet(MOD.main)
             self.assertEqual(rc, MOD.SIGNAL_EXIT_BASE + int(signal.SIGINT))
             self.assertIn("cancelled by SIGINT", err_txt)
-            mock_planted.assert_not_called()
+            planted.assert_not_called()
 
     def test_run_leg_raises_on_cleanup_or_deadline_cancel(self) -> None:
         """Raise ``LegCancelled`` when cancelled during cleanup or deadline stop."""
