@@ -12,9 +12,10 @@ the gate fails when a mutant survives and that every exclusion still names
 exactly one surviving equivalent mutant.
 
 Both legs run from the repository root. The Linux-only runner marks itself a
-child subreaper, strips ``CARGO_MUTANTS_*`` and ``CARGO_TARGET_*_RUNNER``
-environment overrides, kills session and reparented leftovers through pidfds,
-and fails closed unless ``waitpid(-1, WNOHANG)`` proves ``ECHILD``.
+child subreaper, allow-lists Cargo configuration and environment keys, and
+checks that prlimit applies the cap before either leg runs. A test in each
+package verifies the inherited cap. The runner kills session and reparented
+leftovers through pidfds and requires ``waitpid(-1, WNOHANG)`` to prove ``ECHILD``.
 """
 
 from __future__ import annotations
@@ -37,8 +38,21 @@ from types import FrameType
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / ".cargo" / "mutants.toml"
 ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
+ALLOWED_CARGO_CONFIG_KEYS = frozenset(
+    {"http", "net", "profile", "registries", "registry", "source", "term"}
+)
+ALLOWED_CARGO_ENV_KEYS = frozenset({"CARGO_HOME", "CARGO_INCREMENTAL"})
+ALLOWED_CARGO_ENV_PREFIXES = (
+    "CARGO_HTTP_",
+    "CARGO_NET_",
+    "CARGO_PROFILE_",
+    "CARGO_REGISTRIES_",
+    "CARGO_REGISTRY_",
+    "CARGO_TERM_",
+)
+TEST_RUNNER_CAP_BYTES = 4294967296
 # Required as one additional_cargo_args entry in .cargo/mutants.toml.
-TEST_RUNNER_CAP_ARG = """--config=target.'cfg(target_os = "linux")'.runner=["prlimit", "--as=4294967296"]"""
+TEST_RUNNER_CAP_ARG = f"""--config=target.'cfg(target_os = "linux")'.runner=["prlimit", "--as={TEST_RUNNER_CAP_BYTES}"]"""
 # Each element is forwarded to Cargo. Another --config argument could set a target
 # runner that overrides the cap, so adding an element here requires review.
 ALLOWED_CARGO_ARGS = ("--locked", TEST_RUNNER_CAP_ARG)
@@ -59,7 +73,6 @@ COMMON_ARGS = (
     "--timeout",
     "120",
 )
-CARGO_MUTANTS_ENV_PREFIX = "CARGO_MUTANTS_"
 # Leg + stop time must fit mutants job timeout-minutes in .github/workflows/rust.yml:
 # stop takes at most TERMINATE_GRACE_SECONDS + 2 * KILL_WAIT_SECONDS = 80 s (grace
 # plus up to two kill waits), and cleanup adds at most
@@ -187,19 +200,51 @@ def enable_subreaper() -> bool:
 
 
 def leg_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    """Return a copy without cargo-mutants overrides or per-target Cargo runners."""
+    """Keep approved Cargo keys and mark the cap that each test suite must see."""
     keys = list(environ.keys())
     cleaned: dict[str, str] = {}
-    runner_keys: list[str] = []
+    dropped: list[str] = []
     for idx in range(len(keys)):
         key = keys[idx]
-        if key.startswith("CARGO_TARGET_") and key.endswith("_RUNNER"):
-            runner_keys.append(repr(key))
-        elif not key.startswith(CARGO_MUTANTS_ENV_PREFIX):
+        if (
+            not key.startswith("CARGO_")
+            or key in ALLOWED_CARGO_ENV_KEYS
+            or key.startswith(ALLOWED_CARGO_ENV_PREFIXES)
+        ):
             cleaned[key] = environ[key]
-    if runner_keys:
-        err(f"dropped Cargo runner environment keys: {', '.join(sorted(runner_keys))}")
+        else:
+            dropped.append(key)
+    if dropped:
+        err(f"dropped Cargo environment keys: {', '.join(map(repr, sorted(dropped)))}")
+    cleaned["RHIZOMORPH_MUTANTS_AS_CAP"] = str(TEST_RUNNER_CAP_BYTES)
     return cleaned
+
+
+def check_prlimit(env: Mapping[str, str]) -> bool:
+    """Require the prlimit on the leg's PATH to set the child's soft limit."""
+    cap = str(TEST_RUNNER_CAP_BYTES)
+    cmd = [
+        "prlimit",
+        f"--as={cap}",
+        sys.executable,
+        "-I",
+        "-c",
+        "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0])",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, check=False, env=env, cwd=REPO_ROOT, capture_output=True, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        err(f"prlimit preflight failed: {exc}")
+        return False
+    if result.returncode != 0:
+        err(f"prlimit preflight failed with exit {result.returncode}")
+        return False
+    if result.stdout.strip() != cap.encode("ascii"):
+        err(f"prlimit preflight did not report the expected RLIMIT_AS of {cap} bytes")
+        return False
+    return True
 
 
 def parse_string_list(raw: object, key: str, path: Path) -> list[str] | None:
@@ -257,40 +302,17 @@ def check_cargo_config(path: Path) -> bool:
         with path.open("rb") as handle:
             raw = tomllib.load(handle)
     except FileNotFoundError:
+        # Cargo also treats a dangling config symlink as absent.
         return True
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         err(f"failed to read {path}: {exc}")
         return False
 
-    # An included file can set a target runner that overrides the memory cap.
-    if "include" in raw:
-        err(f"include in {path} can override the memory cap")
+    # Keys outside the allow-list can change which program runs the tests.
+    unsupported = sorted(raw.keys() - ALLOWED_CARGO_CONFIG_KEYS)
+    if unsupported:
+        err(f"unsupported Cargo config keys in {path}: {', '.join(unsupported)}")
         return False
-
-    env = raw.get("env", {})
-    if not isinstance(env, dict):
-        err(f"malformed env in {path}: expected a table")
-        return False
-    # A forced PATH changes which prlimit the memory cap runs.
-    if "PATH" in env:
-        err(f"env.PATH in {path} can override the prlimit executable")
-        return False
-
-    targets = raw.get("target", {})
-    if not isinstance(targets, dict):
-        err(f"malformed target in {path}: expected a table")
-        return False
-    keys = list(targets)
-    for idx in range(len(keys)):
-        key = keys[idx]
-        target = targets[key]
-        if not isinstance(target, dict):
-            err(f"malformed target.{key} in {path}: expected a table")
-            return False
-        # A runner here can override or conflict with the test runner memory cap.
-        if "runner" in target:
-            err(f"runner for target {key!r} in {path} can override the memory cap")
-            return False
     return True
 
 
@@ -749,9 +771,9 @@ def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
 
     The executable and subcommand are literals at the call site, each element
     of ``args`` is passed as one argv element without a shell, and the leg runs
-    in a session of its own so every descendant can be found. Inherited
-    ``CARGO_MUTANTS_*`` environment variables are stripped via
-    ``leg_environment`` so CLI flags govern every run. Processes left in the
+    in a session of its own so every descendant can be found. The Cargo
+    environment is filtered via ``leg_environment`` so CLI flags govern every
+    run and test binaries can verify the cap. Processes left in the
     leg session are killed while the unreaped ``cargo-mutants`` zombie holds the
     session ID, and child-subreaper orphan cleanup then requires ``waitpid``
     ``ECHILD`` proof before returning the exit code. Exceeding
@@ -983,7 +1005,7 @@ def run_gate_leg() -> int:
 
 
 def main() -> int:
-    """Run configuration validation, the gate leg, and the planted leg."""
+    """Validate configuration and the runner cap before running both legs."""
     # Signals are recorded, never raised, so a leg stop cannot be interrupted
     # (cargo-mutants runs in its own session and does not get them).
     signal.signal(signal.SIGINT, request_cancel)
@@ -992,6 +1014,9 @@ def main() -> int:
     if config is None:
         cancelled = cancel_status()
         return cancelled if cancelled is not None else status
+    if not check_prlimit(leg_environment(os.environ)):
+        cancelled = cancel_status()
+        return cancelled if cancelled is not None else 2
     if not enable_subreaper():
         cancelled = cancel_status()
         return cancelled if cancelled is not None else 1
