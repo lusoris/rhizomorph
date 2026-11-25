@@ -24,6 +24,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Callable, Iterator
@@ -124,6 +125,73 @@ def write_mutants_out(base_dir: Path, files: dict[str, str]) -> Path:
         name = names[idx]
         (mutants_out / name).write_text(files[name], encoding="utf-8")
     return mutants_out
+
+
+def write_cap_stamps(
+    stamp_dir: Path, packages: tuple[str, ...] = ("kernel", "kernel-std")
+) -> None:
+    """Write exact cap stamps for the requested packages."""
+    for idx in range(len(packages)):
+        (stamp_dir / packages[idx]).write_text(
+            str(MOD.TEST_RUNNER_CAP_BYTES), encoding="ascii"
+        )
+
+
+class CapStampTests(unittest.TestCase):
+    """Require two regular files with an exact, bounded cap representation."""
+
+    def setUp(self) -> None:
+        """Start with one valid stamp from each package."""
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        self.stamp_dir = Path(tmp_dir.name)
+        write_cap_stamps(self.stamp_dir)
+        self.stamp = self.stamp_dir / "kernel-std"
+
+    def assert_stamp_rejected(self, message: str) -> None:
+        """Require a rejection naming the planted leg and the bad package."""
+        ok, _, err_txt = call_quiet(MOD.check_cap_stamps, "planted", self.stamp_dir)
+        self.assertFalse(ok)
+        self.assertIn("planted leg", err_txt)
+        self.assertIn("kernel-std", err_txt)
+        self.assertIn(message, err_txt)
+
+    def test_accepts_both_exact_stamps(self) -> None:
+        """Accept matching decimal stamps for both packages."""
+        ok, _, err_txt = call_quiet(MOD.check_cap_stamps, "gate", self.stamp_dir)
+        self.assertTrue(ok)
+        self.assertEqual(err_txt, "")
+
+    def test_rejects_missing_or_non_regular_stamp(self) -> None:
+        """Refuse a missing stamp or a directory at the stamp path."""
+        self.stamp.unlink()
+        self.assert_stamp_rejected("failed to read")
+        self.stamp.mkdir()
+        self.assert_stamp_rejected("not a regular file")
+
+    def test_rejects_wrong_cap_and_trailing_newline(self) -> None:
+        """Require the exact decimal value with no newline."""
+        self.stamp.write_text(str(MOD.TEST_RUNNER_CAP_BYTES - 1), encoding="ascii")
+        self.assert_stamp_rejected("expected")
+        self.stamp.write_text(f"{MOD.TEST_RUNNER_CAP_BYTES}\n", encoding="ascii")
+        self.assert_stamp_rejected("expected")
+
+    def test_bounds_stamp_read_at_64_bytes(self) -> None:
+        """Read at most 64 bytes and refuse extra bytes after the decimal cap."""
+        cap = str(MOD.TEST_RUNNER_CAP_BYTES).encode("ascii")
+        for length in range(64, 66):
+            with self.subTest(length=length):
+                data = cap.ljust(length, b" ")
+                self.stamp.write_bytes(data)
+                output = io.BytesIO(data)
+                with (
+                    mock.patch.object(output, "read", wraps=output.read) as read,
+                    mock.patch.object(
+                        MOD.os, "fdopen", side_effect=(io.BytesIO(cap), output)
+                    ),
+                ):
+                    self.assert_stamp_rejected("expected")
+                read.assert_called_once_with(64)
 
 
 class GateCountsTests(unittest.TestCase):
@@ -259,6 +327,36 @@ class VerifyPlantedOutputsTests(unittest.TestCase):
                 ["src/lib.rs:10: alpha_fn", "src/lib.rs:20: beta_fn"],
             )
             self.assertEqual(err_txt, "")
+
+    def test_planted_leg_requires_both_stamps_after_missed_exit(self) -> None:
+        """Require both cap stamps even when the planted outcomes are correct."""
+        config = MOD.MutantsConfig(self.compile_fixture_patterns(["alpha$"]), [], False)
+
+        def fake_run_leg(
+            name: str, args: list[str], timeout: int, stamp_dir: Path
+        ) -> int:
+            """Populate the outputs and only the stamps requested by this case."""
+            self.assertEqual((name, timeout), ("planted", MOD.PLANTED_TIMEOUT_SECONDS))
+            output_dir = Path(args[args.index("--output") + 1])
+            self.assertEqual(stamp_dir.parent, output_dir)
+            self.assertTrue(stamp_dir.is_absolute())
+            self.assertEqual(list(stamp_dir.iterdir()), [])
+            write_mutants_out(output_dir, {**EMPTY_FILES, "missed.txt": "alpha\n"})
+            write_cap_stamps(stamp_dir, packages)
+            return MOD.MISSED_EXIT_CODE
+
+        cases = ((("kernel", "kernel-std"), 0), (("kernel",), 1))
+        for idx in range(len(cases)):
+            packages, expected = cases[idx]
+            with (
+                self.subTest(packages=packages),
+                mock.patch.object(MOD, "run_leg", side_effect=fake_run_leg),
+            ):
+                rc, _, err_txt = call_quiet(MOD.run_planted_leg, config)
+                self.assertEqual(rc, expected, err_txt)
+                if expected:
+                    self.assertIn("planted leg", err_txt)
+                    self.assertIn("kernel-std", err_txt)
 
     def test_verify_planted_outputs_non_empty_outcomes(self) -> None:
         """Reject non-empty ``caught.txt``, ``timeout.txt``, or ``unviable.txt``."""
@@ -464,6 +562,25 @@ class ConfigAndArgvTests(unittest.TestCase):
             self.assertEqual(status, expected_status)
             self.assertIn(expected_msg, err_txt)
 
+    def test_load_config_reports_overflowing_exclusion(self) -> None:
+        """Return the configuration error status and name the oversized regex."""
+        pattern = "a{4294967295}"
+        cfg, status, err_txt = self.load_toml_text(
+            CAPPED_CARGO_ARGS + f'exclude_re = ["{pattern}"]\n'
+        )
+        self.assertIsNone(cfg)
+        self.assertEqual(status, 2)
+        self.assertIn(f"invalid exclude_re regex {pattern!r}", err_txt)
+
+    def test_load_config_accepts_large_valid_exclusion(self) -> None:
+        """Compile a valid large repetition count at the fixture boundary."""
+        pattern = "a{65535}"
+        cfg, status, err_txt = self.load_toml_text(
+            CAPPED_CARGO_ARGS + f'exclude_re = ["{pattern}"]\n'
+        )
+        self.assertEqual(status, 0, err_txt)
+        self.assertEqual(cfg.exclude_re[0][1].pattern, pattern)
+
     def test_build_planted_args_preserves_worker_bound_and_runner_cap(self) -> None:
         """Pass the cap as one argument, set ``--jobs 1`` once, and end with ``-F``."""
         compiled, _, _ = call_quiet(
@@ -479,6 +596,8 @@ class ConfigAndArgvTests(unittest.TestCase):
         jobs_idx = args.index("--jobs")
         self.assertEqual(args[jobs_idx : jobs_idx + 2], ["--jobs", "1"])
         self.assertIn(f"--cargo-arg={MOD.TEST_RUNNER_CAP_ARG}", args)
+        test_package_idx = args.index("--test-package")
+        self.assertEqual(args[test_package_idx + 1], "kernel,kernel-std")
         self.assertEqual(args[-2:], ["-F", "last_pat$"])
 
     def test_common_args_select_both_packages(self) -> None:
@@ -509,31 +628,54 @@ class ConfigAndArgvTests(unittest.TestCase):
             "CARGO_SOURCE_EXAMPLE_REPLACE_WITH",
         )
         marker = "RHIZOMORPH_MUTANTS_AS_CAP"
-        source = {**kept, **dict.fromkeys(dropped, "fixture-value"), marker: "1"}
+        stamp_key = "RHIZOMORPH_MUTANTS_AS_CAP_STAMP_DIR"
+        stamp_dir = Path("relative-fixture-stamp-dir")
+        source = {
+            **kept,
+            **dict.fromkeys(dropped, "fixture-value"),
+            marker: "1",
+            stamp_key: "/stale-stamp-dir",
+        }
         snapshot = dict(source)
-        cleaned, _, err_txt = call_quiet(MOD.leg_environment, source)
+        cleaned, _, err_txt = call_quiet(MOD.leg_environment, source, stamp_dir)
         self.assertEqual(source, snapshot)
-        self.assertEqual(cleaned, {**kept, marker: "4294967296"})
+        self.assertEqual(
+            cleaned,
+            {**kept, marker: "4294967296", stamp_key: str(stamp_dir.absolute())},
+        )
         self.assertEqual(len(err_txt.splitlines()), 1)
         self.assertEqual(
             err_txt.split(": ")[-1].strip(), ", ".join(map(repr, sorted(dropped)))
         )
         self.assertNotIn("fixture-value", err_txt)
 
-    def test_leg_environment_adds_cap_to_empty_environment(self) -> None:
-        """Set the same marker when it is absent and leave stderr quiet."""
+    def test_leg_environment_uses_default_path_when_unset(self) -> None:
+        """Use the same absolute default for Cargo and preflight when PATH is unset."""
         cleaned, _, err_txt = call_quiet(MOD.leg_environment, {})
-        self.assertEqual(cleaned, {"RHIZOMORPH_MUTANTS_AS_CAP": "4294967296"})
+        self.assertEqual(cleaned, {"PATH": os.defpath})
+        self.assertEqual(err_txt, "")
+
+    def test_preflight_environment_has_no_compile_markers(self) -> None:
+        """Discard inherited compile-time markers when building the preflight env."""
+        source = {
+            "PATH": os.defpath,
+            "RHIZOMORPH_MUTANTS_AS_CAP": "1",
+            "RHIZOMORPH_MUTANTS_AS_CAP_STAMP_DIR": "/stale-stamp-dir",
+        }
+        cleaned, _, err_txt = call_quiet(MOD.leg_environment, source)
+        self.assertEqual(cleaned, {"PATH": os.defpath})
         self.assertEqual(err_txt, "")
 
     def _invoke_gate_leg_capturing_dir(
-        self, caught: int, unviable: int, leg_rc: int = 0
+        self, caught: int, unviable: int, leg_rc: int = 0, *, has_stamps: bool = True
     ) -> tuple[int, str, Path]:
         """Run ``run_gate_leg`` with ``run_leg`` stubbed to populate ``--output``."""
         seen_dirs: list[Path] = []
         cwd_resolved = Path.cwd().resolve()
 
-        def fake_run_leg(leg_name: str, leg_args: list[str], leg_timeout: int) -> int:
+        def fake_run_leg(
+            leg_name: str, leg_args: list[str], leg_timeout: int, stamp_dir: Path
+        ) -> int:
             """Validate private ``--output`` directory and write fixture counts."""
             self.assertEqual(leg_name, "gate")
             self.assertEqual(leg_timeout, MOD.GATE_TIMEOUT_SECONDS)
@@ -546,6 +688,9 @@ class ConfigAndArgvTests(unittest.TestCase):
             self.assertNotEqual(out_resolved, (cwd_resolved / "mutants.out").resolve())
             self.assertNotEqual(out_resolved, cwd_resolved)
             seen_dirs.append(out_dir)
+            self.assertEqual(stamp_dir.parent, out_dir)
+            self.assertTrue(stamp_dir.is_absolute())
+            self.assertEqual(list(stamp_dir.iterdir()), [])
             if leg_rc == 0:
                 write_mutants_out(
                     out_dir,
@@ -554,6 +699,8 @@ class ConfigAndArgvTests(unittest.TestCase):
                         "unviable.txt": "unviable\n" * unviable,
                     },
                 )
+                if has_stamps:
+                    write_cap_stamps(stamp_dir)
             return leg_rc
 
         with mock.patch.object(MOD, "run_leg", side_effect=fake_run_leg):
@@ -591,6 +738,15 @@ class ConfigAndArgvTests(unittest.TestCase):
         dirs.append(out_dir)
 
         self.assertEqual(len(set(dirs)), 3)
+
+    def test_gate_leg_requires_stamps_after_passing_counts(self) -> None:
+        """Refuse passing cargo-mutants counts when neither package stamped the cap."""
+        rc, err_txt, _ = self._invoke_gate_leg_capturing_dir(
+            MOD.GATE_CAUGHT_FLOOR, MOD.GATE_UNVIABLE_CEILING, has_stamps=False
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("gate leg", err_txt)
+        self.assertIn("kernel", err_txt)
 
     def test_gate_leg_private_dir_follows_tmpdir_inside_cwd(self) -> None:
         """Accept a ``tempfile`` directory inside cwd and still enforce gate counts."""
@@ -642,7 +798,9 @@ class ConfigAndArgvTests(unittest.TestCase):
             os.chdir(cwd_dir)
             try:
 
-                def fake_run_leg(_name: str, leg_args: list[str], _timeout: int) -> int:
+                def fake_run_leg(
+                    _name: str, leg_args: list[str], _timeout: int, stamp_dir: Path
+                ) -> int:
                     """Write failing counts only when ``--output`` is outside cwd."""
                     out_dir = Path(leg_args[leg_args.index("--output") + 1])
                     if not out_dir.resolve().is_relative_to(cwd_dir):
@@ -653,6 +811,7 @@ class ConfigAndArgvTests(unittest.TestCase):
                                 "unviable.txt": "unviable\n" * pass_unviable,
                             },
                         )
+                    write_cap_stamps(stamp_dir)
                     return 0
 
                 with mock.patch.object(MOD, "run_leg", side_effect=fake_run_leg):
@@ -683,7 +842,10 @@ class ConfigAndArgvTests(unittest.TestCase):
             mock.patch.object(MOD, "wait_exited", return_value=True),
             mock.patch.object(MOD, "reap_exited_leg", return_value=0),
         ):
-            rc, _, err_txt = call_quiet(MOD.run_leg, "gate", ["--output", "."], 5)
+            stamp_dir = Path("fixture-stamps").absolute()
+            rc, _, err_txt = call_quiet(
+                MOD.run_leg, "gate", ["--output", "."], 5, stamp_dir
+            )
         self.assertEqual(rc, 0)
         self.assertIn(runner_key, err_txt)
         self.assertEqual(mock_popen.call_args.kwargs.get("cwd"), MOD.REPO_ROOT)
@@ -693,6 +855,9 @@ class ConfigAndArgvTests(unittest.TestCase):
         self.assertNotIn(runner_key, popen_env)
         self.assertEqual(popen_env.get("MUTANTS_CHECK_KEEP"), "present")
         self.assertEqual(popen_env.get("RHIZOMORPH_MUTANTS_AS_CAP"), "4294967296")
+        self.assertEqual(
+            popen_env.get("RHIZOMORPH_MUTANTS_AS_CAP_STAMP_DIR"), str(stamp_dir)
+        )
 
 
 class RepositoryCargoConfigTests(unittest.TestCase):
@@ -869,6 +1034,23 @@ class RepositoryCargoConfigTests(unittest.TestCase):
         self.mutants_config.write_bytes(b"\xff")
         self.assert_config_rejected(self.mutants_config, "failed to read")
 
+    def test_mutants_and_cargo_config_size_limit(self) -> None:
+        """Accept valid TOML at 1 MiB and refuse it one byte past the limit."""
+        limit = 1024 * 1024
+        cases = (
+            (self.cargo_dir / "config.toml", b"[term]\n#"),
+            (self.mutants_config, self.mutants_config.read_bytes() + b"#"),
+        )
+        for idx in range(len(cases)):
+            path, start = cases[idx]
+            with self.subTest(path=path):
+                content = start.ljust(limit, b"x")
+                path.write_bytes(content)
+                self.assert_config_accepted()
+                path.write_bytes(content + b"x")
+                self.assert_config_rejected(path, f"exceeds {limit} bytes")
+                path.unlink()
+
 
 class AddressSpaceSkipReasonTests(unittest.TestCase):
     """Check Cargo canary limit compatibility without reading process limits."""
@@ -935,11 +1117,14 @@ class CargoRunnerCapTests(unittest.TestCase):
         tmp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(tmp_dir.cleanup)
         self.cargo_home = Path(tmp_dir.name)
+        self.stamp_dir = self.cargo_home / "stamps"
+        self.stamp_dir.mkdir()
         self.env = {
             key: value
             for key, value in os.environ.items()
             if not key.startswith(("CARGO_", "GIT_"))
-            and key != "RHIZOMORPH_MUTANTS_AS_CAP"
+            and key
+            not in {"RHIZOMORPH_MUTANTS_AS_CAP", "RHIZOMORPH_MUTANTS_AS_CAP_STAMP_DIR"}
         }
         self.env.update(
             CARGO_HOME=tmp_dir.name,
@@ -947,12 +1132,27 @@ class CargoRunnerCapTests(unittest.TestCase):
             CARGO_TARGET_DIR=str(MOD.REPO_ROOT / "target" / "mutants-cap-fixture"),
         )
 
-    def run_canary(self, *, mutation_leg: bool) -> subprocess.CompletedProcess[str]:
-        """Build and run only the shared canary, optionally with the mutation cap."""
+    def run_canary(
+        self, *, marker: bool = False, stamp_dir: bool = False, capped: bool = False
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the shared canary for both packages, optionally with the mutation cap."""
         env = self.env.copy()
-        args = ["cargo", "test", "--locked", "-p", "kernel", "--test", "mutants_cap"]
-        if mutation_leg:
+        args = [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "kernel",
+            "-p",
+            "kernel-std",
+            "--test",
+            "mutants_cap",
+        ]
+        if marker:
             env["RHIZOMORPH_MUTANTS_AS_CAP"] = str(MOD.TEST_RUNNER_CAP_BYTES)
+        if stamp_dir:
+            env["RHIZOMORPH_MUTANTS_AS_CAP_STAMP_DIR"] = str(self.stamp_dir)
+        if capped:
             args.append(MOD.TEST_RUNNER_CAP_ARG)
         args.extend(("--", "mutation_runner_sets_address_space_cap"))
         return subprocess.run(
@@ -983,7 +1183,7 @@ class CargoRunnerCapTests(unittest.TestCase):
         (self.cargo_home / "config.toml").write_text(
             f'[target.{host}]\nrunner = ["env", "-i"]\n', encoding="utf-8"
         )
-        result = self.run_canary(mutation_leg=True)
+        result = self.run_canary(marker=True, stamp_dir=True, capped=True)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("mutation_runner_sets_address_space_cap", result.stdout)
         self.assertIn("mutation test binary must inherit RLIMIT_AS", result.stdout)
@@ -991,23 +1191,66 @@ class CargoRunnerCapTests(unittest.TestCase):
     def test_mutation_leg_with_cap_runner_passes(self) -> None:
         """Accept the configured prlimit runner when it applies the requested cap."""
         skip_for_inherited_limits(self, needs_distinct_soft=False)
-        result = self.run_canary(mutation_leg=True)
+        result = self.run_canary(marker=True, stamp_dir=True, capped=True)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
             "test mutation_runner_sets_address_space_cap ... ok", result.stdout
+        )
+        self.assertEqual(
+            (self.stamp_dir / "kernel").read_text(encoding="ascii"),
+            str(MOD.TEST_RUNNER_CAP_BYTES),
+        )
+        self.assertEqual(
+            (self.stamp_dir / "kernel-std").read_text(encoding="ascii"),
+            str(MOD.TEST_RUNNER_CAP_BYTES),
         )
 
     def test_unmarked_build_without_cap_passes(self) -> None:
         """Allow plain Cargo tests without the mutation marker or runner cap."""
-        result = self.run_canary(mutation_leg=False)
+        result = self.run_canary()
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
             "test mutation_runner_sets_address_space_cap ... ok", result.stdout
         )
 
+    def test_marker_without_stamp_dir_fails(self) -> None:
+        """Reject a partial marker even when the runner enforces the limit."""
+        skip_for_inherited_limits(self, needs_distinct_soft=False)
+        result = self.run_canary(marker=True, capped=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("missing RHIZOMORPH_MUTANTS_AS_CAP_STAMP_DIR", result.stdout)
+
+    def test_stamp_dir_without_marker_fails(self) -> None:
+        """Reject a missing cap marker when the stamp directory reaches compilation."""
+        result = self.run_canary(stamp_dir=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("missing RHIZOMORPH_MUTANTS_AS_CAP", result.stdout)
+
 
 class PrlimitTests(unittest.TestCase):
     """Verify the executable on the leg's PATH enforces the cap."""
+
+    def test_main_refuses_cwd_sensitive_path_entries_before_preflight(self) -> None:
+        """Refuse empty and relative entries without launching prlimit or any leg."""
+        config = MOD.MutantsConfig([], [], False)
+        entries = ("", ".", "bin")
+        for idx in range(len(entries)):
+            entry = entries[idx]
+            env = {"PATH": os.pathsep.join(("/usr/bin", entry, "/bin"))}
+            with (
+                self.subTest(entry=entry),
+                mock.patch.object(signal, "signal"),
+                mock.patch.object(MOD, "load_config", return_value=(config, 0)),
+                mock.patch.object(MOD, "leg_environment", return_value=env),
+                mock.patch.object(MOD, "enable_subreaper", return_value=True),
+                mock.patch.object(MOD, "check_prlimit", return_value=True) as preflight,
+                mock.patch.object(MOD, "run_gate_leg", return_value=1) as gate,
+            ):
+                rc, _, err_txt = call_quiet(MOD.main)
+                self.assertEqual(rc, 2)
+                self.assertIn(f"PATH entry 1 {entry!r}", err_txt)
+                preflight.assert_not_called()
+                gate.assert_not_called()
 
     def test_real_prlimit_sets_cap(self) -> None:
         """Accept util-linux prlimit when the Python child sees 4 GiB."""
@@ -1122,7 +1365,7 @@ class PrlimitTests(unittest.TestCase):
     def test_main_enables_subreaper_before_preflight(self) -> None:
         """Enable subreaping, pass the leg environment, and stop on preflight failure."""
         config = MOD.MutantsConfig([], [], False)
-        env = {"PATH": os.defpath, "RHIZOMORPH_MUTANTS_AS_CAP": "4294967296"}
+        env = {"PATH": os.defpath}
         startup = mock.Mock()
         with (
             mock.patch.object(signal, "signal"),
@@ -1717,7 +1960,7 @@ class CancellationTests(unittest.TestCase):
             mock.patch.object(MOD, "reap_orphans", return_value=True),
         ):
             with self.assertRaises(MOD.LegCancelled) as ctx:
-                call_quiet(MOD.run_leg, "gate", [], 5)
+                call_quiet(MOD.run_leg, "gate", [], 5, Path("fixture-stamps"))
             self.assertEqual(ctx.exception.signum, int(signal.SIGTERM))
 
         MOD.CANCEL_SIGNALS.clear()
@@ -1732,7 +1975,7 @@ class CancellationTests(unittest.TestCase):
             mock.patch.object(MOD, "stop_leg", side_effect=cancel_during_stop),
         ):
             with self.assertRaises(MOD.LegCancelled) as ctx:
-                call_quiet(MOD.run_leg, "gate", [], 0)
+                call_quiet(MOD.run_leg, "gate", [], 0, Path("fixture-stamps"))
             self.assertEqual(ctx.exception.signum, int(signal.SIGINT))
 
 
@@ -1891,7 +2134,7 @@ class RealDescendantCleanupTests(unittest.TestCase):
             mock.patch.dict(os.environ, {"PATH": prepended_path}),
             mock.patch.object(MOD, "TERMINATE_GRACE_SECONDS", 1),
         ):
-            rc, _, err_txt = call_quiet(MOD.run_leg, "gate", [], 2)
+            rc, _, err_txt = call_quiet(MOD.run_leg, "gate", [], 2, self.base)
         self.assertIsNone(rc)
         self.assertIn("exceeded its 2s deadline", err_txt)
         self._assert_fifo_byte_then_eof()
@@ -1902,7 +2145,7 @@ class RealDescendantCleanupTests(unittest.TestCase):
         self._write_process_stub("cargo", "setsid", "exit 0")
         prepended_path = f"{self.base}{os.pathsep}{os.environ.get('PATH', '')}"
         with mock.patch.dict(os.environ, {"PATH": prepended_path}):
-            rc, _, err_txt = call_quiet(MOD.run_leg, "gate", [], 5)
+            rc, _, err_txt = call_quiet(MOD.run_leg, "gate", [], 5, self.base)
         self.assertEqual(rc, 0)
         self.assertEqual(err_txt, "")
         self._assert_fifo_byte_then_eof()
@@ -1912,6 +2155,40 @@ class RealDescendantCleanupTests(unittest.TestCase):
         pid = int(self.pid_file.read_text(encoding="utf-8"))
         self.assertFalse(Path(f"/proc/{pid}").exists(), f"descendant {pid} remains")
         self._assert_fifo_byte_then_eof()
+
+    def test_signal_cancellation_reaps_live_descendant(self) -> None:
+        """Cancel a live session after its background child records its PID."""
+
+        def cancel_when_ready() -> None:
+            """Record SIGTERM only after the shell has written a complete PID."""
+            for _ in range(100):
+                with contextlib.suppress(FileNotFoundError):
+                    if self.pid_file.read_text(encoding="ascii").endswith("\n"):
+                        MOD.CANCEL_SIGNALS.append(int(signal.SIGTERM))
+                        return
+                time.sleep(0.02)
+
+        timer = threading.Timer(0, cancel_when_ready)
+        argv = ["sh", "-c", 'sleep 30 & echo $! > "$1"; wait', "sh", str(self.pid_file)]
+        timer.start()
+        try:
+            with self.assertRaises(MOD.LegCancelled) as ctx:
+                call_quiet(
+                    MOD.run_session, "cancel fixture", argv, 5, {"PATH": os.defpath}
+                )
+        finally:
+            timer.cancel()
+            timer.join(timeout=3)
+        self.assertEqual(ctx.exception.signum, int(signal.SIGTERM))
+        pid = int(self.pid_file.read_text(encoding="ascii"))
+        self.assertGreater(pid, 1)
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+        self.fail(f"descendant {pid} survived cancellation")
 
     def test_prlimit_timeout_reaps_descendant(self) -> None:
         """Reject a timed-out prlimit and reap its background child before return."""

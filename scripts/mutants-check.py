@@ -13,8 +13,8 @@ exactly one surviving equivalent mutant.
 
 Both legs run from the repository root. The Linux-only runner marks itself a
 child subreaper, allow-lists Cargo configuration and environment keys, and
-checks that prlimit applies the cap before either leg runs. A test in each
-package compares the inherited limit with the cap recorded at compile time.
+checks that prlimit applies the cap before either leg runs. Each leg requires
+a stamp from each package's canary confirming the inherited limit.
 The runner kills session and reparented leftovers through pidfds and requires
 ``waitpid(-1, WNOHANG)`` to prove ``ECHILD``.
 """
@@ -40,6 +40,8 @@ from typing import BinaryIO
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / ".cargo" / "mutants.toml"
+# Bound the data read and parsed from each mutation or Cargo config file.
+CONFIG_MAX_BYTES = 1024 * 1024
 ALLOWED_KEYS = frozenset({"exclude_re", "additional_cargo_args", "cap_lints"})
 ALLOWED_CARGO_CONFIG_KEYS = frozenset(
     {"http", "net", "profile", "registries", "registry", "source", "term"}
@@ -54,6 +56,9 @@ ALLOWED_CARGO_ENV_PREFIXES = (
     "CARGO_TERM_",
 )
 TEST_RUNNER_CAP_BYTES = 4294967296
+CAP_MARKER_ENV = "RHIZOMORPH_MUTANTS_AS_CAP"
+CAP_STAMP_DIR_ENV = "RHIZOMORPH_MUTANTS_AS_CAP_STAMP_DIR"
+CAP_STAMP_PACKAGES = ("kernel", "kernel-std")
 # Required as one additional_cargo_args entry in .cargo/mutants.toml.
 TEST_RUNNER_CAP_ARG = f"""--config=target.'cfg(target_os = "linux")'.runner=["prlimit", "--as={TEST_RUNNER_CAP_BYTES}"]"""
 # Each element is forwarded to Cargo. Another --config argument could set a target
@@ -203,8 +208,10 @@ def enable_subreaper() -> bool:
     return True
 
 
-def leg_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    """Keep approved Cargo keys and set the compile-time marker for the cap."""
+def leg_environment(
+    environ: Mapping[str, str], stamp_dir: Path | None = None
+) -> dict[str, str]:
+    """Keep approved Cargo keys and set compile-time markers for mutation legs."""
     keys = list(environ.keys())
     cleaned: dict[str, str] = {}
     dropped: list[str] = []
@@ -220,8 +227,55 @@ def leg_environment(environ: Mapping[str, str]) -> dict[str, str]:
             dropped.append(key)
     if dropped:
         err(f"dropped Cargo environment keys: {', '.join(map(repr, sorted(dropped)))}")
-    cleaned["RHIZOMORPH_MUTANTS_AS_CAP"] = str(TEST_RUNNER_CAP_BYTES)
+    if stamp_dir is None:
+        cleaned.pop(CAP_MARKER_ENV, None)
+        cleaned.pop(CAP_STAMP_DIR_ENV, None)
+    else:
+        cleaned[CAP_MARKER_ENV] = str(TEST_RUNNER_CAP_BYTES)
+        cleaned[CAP_STAMP_DIR_ENV] = str(stamp_dir.absolute())
+    cleaned.setdefault("PATH", os.defpath)
     return cleaned
+
+
+def check_leg_path(env: Mapping[str, str]) -> bool:
+    """Require executable lookup to be independent of the working directory."""
+    entries = env["PATH"].split(os.pathsep)
+    for idx in range(len(entries)):
+        entry = entries[idx]
+        if not os.path.isabs(entry):
+            err(f"PATH entry {idx} {entry!r} must be an absolute directory")
+            return False
+    return True
+
+
+def read_regular_file(path: Path, max_bytes: int) -> bytes:
+    """Read up to ``max_bytes`` from a regular file without blocking on a FIFO."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return handle.read(max_bytes)
+    finally:
+        os.close(fd)
+
+
+def check_cap_stamps(leg_name: str, stamp_dir: Path) -> bool:
+    """Require each package to have observed the expected cap in this leg."""
+    expected = str(TEST_RUNNER_CAP_BYTES).encode("ascii")
+    for idx in range(len(CAP_STAMP_PACKAGES)):
+        package = CAP_STAMP_PACKAGES[idx]
+        try:
+            observed = read_regular_file(stamp_dir / package, 64)
+        except OSError as exc:
+            err(f"{leg_name} leg: failed to read cap stamp for {package}: {exc}")
+            return False
+        if observed != expected:
+            err(
+                f"{leg_name} leg: invalid cap stamp for {package}; expected {expected!r}"
+            )
+            return False
+    return True
 
 
 def check_prlimit(env: Mapping[str, str]) -> bool:
@@ -283,7 +337,7 @@ def compile_exclusions(
         pattern = patterns[idx]
         try:
             compiled.append((pattern, re.compile(pattern)))
-        except re.error as exc:
+        except (re.error, OverflowError) as exc:
             err(f"invalid exclude_re regex {pattern!r} in {path}: {exc}")
             return None
     return compiled
@@ -311,15 +365,11 @@ def parse_exclusions(
 
 
 def read_config_toml(path: Path) -> dict[str, object]:
-    """Open without waiting on a FIFO and parse only a regular file."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError("not a regular file")
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            return tomllib.load(handle)
-    finally:
-        os.close(fd)
+    """Parse a regular TOML file within the config size limit."""
+    data = read_regular_file(path, CONFIG_MAX_BYTES + 1)
+    if len(data) > CONFIG_MAX_BYTES:
+        raise OSError(f"config exceeds {CONFIG_MAX_BYTES} bytes")
+    return tomllib.loads(data.decode("utf-8"))
 
 
 def check_cargo_config(path: Path) -> bool:
@@ -395,7 +445,16 @@ def load_config(path: Path) -> tuple[MutantsConfig | None, int]:
 
 def build_planted_args(config: MutantsConfig, output_dir: Path) -> list[str]:
     """Build the ``--no-config`` arguments mirroring ``config``."""
-    args = [*COMMON_ARGS, "--no-config", "--output", str(output_dir)]
+    # cargo-mutants 27.1.0 baselines only packages with selected mutants.
+    # The planted filters select kernel mutants. Run both canaries on replay.
+    args = [
+        *COMMON_ARGS,
+        "--no-config",
+        "--output",
+        str(output_dir),
+        "--test-package",
+        ",".join(CAP_STAMP_PACKAGES),
+    ]
     if config.cap_lints:
         args.extend(["--cap-lints", "true"])
     for idx in range(len(config.additional_cargo_args)):
@@ -790,13 +849,15 @@ def reap_exited_leg(leg_name: str, proc: subprocess.Popen[bytes]) -> int | None:
     return reaped_rc
 
 
-def run_leg(leg_name: str, args: list[str], timeout_seconds: int) -> int | None:
+def run_leg(
+    leg_name: str, args: list[str], timeout_seconds: int, stamp_dir: Path
+) -> int | None:
     """Run ``cargo mutants`` in a bounded session with the filtered Cargo environment."""
     return run_session(
         leg_name,
         ["cargo", "mutants", *args],
         timeout_seconds,
-        leg_environment(os.environ),
+        leg_environment(os.environ, stamp_dir),
     )
 
 
@@ -941,9 +1002,11 @@ def verify_planted_outputs(
 def run_planted_leg(config: MutantsConfig) -> int:
     """Execute the planted leg in a temporary directory and verify outcomes."""
     with tempfile.TemporaryDirectory(prefix="mutants-check-") as tmp_dir:
-        output_dir = Path(tmp_dir)
+        output_dir = Path(tmp_dir).absolute()
+        stamp_dir = output_dir / "cap-stamps"
+        stamp_dir.mkdir()
         args = build_planted_args(config, output_dir)
-        rc = run_leg("planted", args, PLANTED_TIMEOUT_SECONDS)
+        rc = run_leg("planted", args, PLANTED_TIMEOUT_SECONDS, stamp_dir)
         if rc is None:
             return 1
         mutants_out = output_dir / "mutants.out"
@@ -956,7 +1019,7 @@ def run_planted_leg(config: MutantsConfig) -> int:
                 verify_planted_outputs(mutants_out, config.exclude_re)
             return 1
         missed_lines = verify_planted_outputs(mutants_out, config.exclude_re)
-        if missed_lines is None:
+        if missed_lines is None or not check_cap_stamps("planted", stamp_dir):
             return 1
         for idx in range(len(missed_lines)):
             print(missed_lines[idx])
@@ -1019,9 +1082,14 @@ def run_gate_leg() -> int:
     population floor before removing it.
     """
     with tempfile.TemporaryDirectory(prefix="mutants-gate-") as tmp_dir:
-        output_dir = Path(tmp_dir)
+        output_dir = Path(tmp_dir).absolute()
+        stamp_dir = output_dir / "cap-stamps"
+        stamp_dir.mkdir()
         gate_rc = run_leg(
-            "gate", [*COMMON_ARGS, "--output", str(output_dir)], GATE_TIMEOUT_SECONDS
+            "gate",
+            [*COMMON_ARGS, "--output", str(output_dir)],
+            GATE_TIMEOUT_SECONDS,
+            stamp_dir,
         )
         if gate_rc is None:
             return 1
@@ -1033,7 +1101,9 @@ def run_gate_leg() -> int:
         caught = count_outcome_lines(mutants_out, "caught.txt")
         if unviable is None or caught is None:
             return 1
-        return 0 if check_gate_counts(caught, unviable) else 1
+        if not check_gate_counts(caught, unviable):
+            return 1
+        return 0 if check_cap_stamps("gate", stamp_dir) else 1
 
 
 def main() -> int:
@@ -1049,7 +1119,8 @@ def main() -> int:
         cancelled = cancel_status()
         return cancelled if cancelled is not None else 1
     try:
-        if not check_prlimit(leg_environment(os.environ)):
+        env = leg_environment(os.environ)
+        if not check_leg_path(env) or not check_prlimit(env):
             cancelled = cancel_status()
             return cancelled if cancelled is not None else 2
         leg_status = run_gate_leg()

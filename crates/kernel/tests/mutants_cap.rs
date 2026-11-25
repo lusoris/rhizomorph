@@ -26,15 +26,21 @@ fn soft_address_space_limit(text: &str) -> Option<Option<u64>> {
     None
 }
 
-/// Fail if the binary's address-space limit differs from the cap set at compile time.
+/// Stamp the package after verifying the address-space limit set at compile time.
 #[test]
 #[allow(
     clippy::assertions_on_constants,
     reason = "Only mutation legs require Linux"
 )]
 fn mutation_runner_sets_address_space_cap() {
-    let Some(marker) = option_env!("RHIZOMORPH_MUTANTS_AS_CAP") else {
-        return;
+    let (marker, stamp_dir) = match (
+        option_env!("RHIZOMORPH_MUTANTS_AS_CAP"),
+        option_env!("RHIZOMORPH_MUTANTS_AS_CAP_STAMP_DIR"),
+    ) {
+        (None, None) => return,
+        (None, Some(_)) => panic!("missing RHIZOMORPH_MUTANTS_AS_CAP"),
+        (Some(_), None) => panic!("missing RHIZOMORPH_MUTANTS_AS_CAP_STAMP_DIR"),
+        (Some(marker), Some(stamp_dir)) => (marker, stamp_dir),
     };
     let cap = Some(marker)
         .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
@@ -51,6 +57,13 @@ fn mutation_runner_sets_address_space_cap() {
         Some(Some(cap)),
         "mutation test binary must inherit RLIMIT_AS of {cap} bytes"
     );
+    let stamp_path = std::path::Path::new(stamp_dir).join(env!("CARGO_PKG_NAME"));
+    if let Err(error) = std::fs::write(&stamp_path, cap.to_string()) {
+        panic!(
+            "failed to write mutation runner cap stamp {}: {error}",
+            stamp_path.display()
+        );
+    }
 }
 
 /// Parse the soft value from a capped `/proc/self/limits` row.
